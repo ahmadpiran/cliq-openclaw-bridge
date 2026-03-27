@@ -8,16 +8,17 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 
+	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/config"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/gateway"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/handler"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/middleware"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/store"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/worker"
+	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/zoho"
 )
 
 func main() {
@@ -27,8 +28,15 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
+	// --- Config ---
+	cfg, err := config.Load()
+	if err != nil {
+		slog.Error("invalid configuration", "error", err)
+		os.Exit(1)
+	}
+
 	// --- Token Store ---
-	tokenStore, err := store.NewTokenStore(dbPath())
+	tokenStore, err := store.NewTokenStore(cfg.Store.DBPath)
 	if err != nil {
 		slog.Error("failed to open token store", "error", err)
 		os.Exit(1)
@@ -38,13 +46,33 @@ func main() {
 			slog.Error("token store close error", "error", err)
 		}
 	}()
-	slog.Info("token store opened", "path", dbPath())
+	slog.Info("token store opened", "path", cfg.Store.DBPath)
+
+	// --- Token Refresher ---
+	refresher := zoho.NewRefresher(zoho.RefresherConfig{
+		ClientID:     cfg.Zoho.ClientID,
+		ClientSecret: cfg.Zoho.ClientSecret,
+		TokenKey:     cfg.Zoho.TokenKey,
+	}, tokenStore)
 
 	// --- Gateway Client ---
-	gw := gateway.New(gateway.DefaultConfig(openclawBaseURL(), openclawAPIKey()))
+	gw := gateway.New(gateway.Config{
+		BaseURL:        cfg.OpenClaw.BaseURL,
+		APIKey:         cfg.OpenClaw.APIKey,
+		MaxRetries:     cfg.OpenClaw.MaxRetries,
+		InitialBackoff: cfg.OpenClaw.InitialBackoff,
+		MaxBackoff:     cfg.OpenClaw.MaxBackoff,
+		HTTPTimeout:    cfg.OpenClaw.HTTPTimeout,
+	})
 
-	// --- Worker Pool (replace the stub handler) ---
-	pool := worker.New(worker.DefaultConfig(), func(ctx context.Context, job worker.Job) error {
+	_ = refresher
+
+	// --- Worker Pool ---
+	pool := worker.New(worker.Config{
+		Workers:    cfg.Worker.Workers,
+		QueueDepth: cfg.Worker.QueueDepth,
+		JobTimeout: cfg.Worker.JobTimeout,
+	}, func(ctx context.Context, job worker.Job) error {
 		return gw.Forward(ctx, gateway.ForwardRequest{
 			Source:     "zoho_cliq",
 			RequestID:  job.RequestID,
@@ -58,24 +86,23 @@ func main() {
 
 	// --- Router ---
 	r := chi.NewRouter()
-
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
 	r.Use(chimiddleware.Recoverer)
 	r.Use(chimiddleware.Heartbeat("/healthz"))
 
 	r.Route("/webhooks", func(r chi.Router) {
-		r.Use(middleware.ZohoHMAC(zohoSecret()))
-		r.Post("/zoho", webhookHandler.HandleZoho) // replaces the 501 stub
+		r.Use(middleware.ZohoHMAC(cfg.Zoho.WebhookSecret))
+		r.Post("/zoho", webhookHandler.HandleZoho)
 	})
 
 	// --- HTTP Server ---
 	srv := &http.Server{
-		Addr:         listenAddr(),
+		Addr:         cfg.Server.Addr(),
 		Handler:      r,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		ReadTimeout:  cfg.Server.ReadTimeout,
+		WriteTimeout: cfg.Server.WriteTimeout,
+		IdleTimeout:  cfg.Server.IdleTimeout,
 	}
 
 	// --- Start Server ---
@@ -100,9 +127,7 @@ func main() {
 	}
 
 	// --- Graceful Shutdown ---
-	// Both srv.Shutdown and pool.Shutdown share the same 30s budget.
-	// HTTP stops accepting first, then the pool drains remaining jobs.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
 	defer cancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
@@ -112,45 +137,4 @@ func main() {
 	pool.Shutdown(shutdownCtx)
 
 	slog.Info("server stopped cleanly")
-}
-
-func listenAddr() string {
-	if port := os.Getenv("PORT"); port != "" {
-		return ":" + port
-	}
-	return ":8080"
-}
-
-func dbPath() string {
-	if p := os.Getenv("BOLT_DB_PATH"); p != "" {
-		return p
-	}
-	return "tokens.db"
-}
-
-func zohoSecret() string {
-	s := os.Getenv("ZOHO_WEBHOOK_SECRET")
-	if s == "" {
-		slog.Error("ZOHO_WEBHOOK_SECRET env var is required")
-		os.Exit(1)
-	}
-	return s
-}
-
-func openclawBaseURL() string {
-	u := os.Getenv("OPENCLAW_BASE_URL")
-	if u == "" {
-		slog.Error("OPENCLAW_BASE_URL env var is required")
-		os.Exit(1)
-	}
-	return u
-}
-
-func openclawAPIKey() string {
-	k := os.Getenv("OPENCLAW_API_KEY")
-	if k == "" {
-		slog.Error("OPENCLAW_API_KEY env var is required")
-		os.Exit(1)
-	}
-	return k
 }
