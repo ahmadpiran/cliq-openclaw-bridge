@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/middleware"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/store"
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
@@ -46,9 +47,8 @@ func main() {
 	r.Use(chimiddleware.Recoverer)             // Catches panics in handlers, returns 500, logs stack trace.
 	r.Use(chimiddleware.Heartbeat("/healthz")) // Lightweight liveness probe; no auth, no logging.
 
-	// --- Route Groups (stubs — handlers wired in later steps) ---
 	r.Route("/webhooks", func(r chi.Router) {
-		// Step 3 will attach the HMAC middleware and POST handler here.
+		r.Use(middleware.ZohoHMAC(zohoSecret()))
 		r.Post("/zoho", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNotImplemented)
 		})
@@ -111,4 +111,15 @@ func dbPath() string {
 		return p
 	}
 	return "tokens.db"
+}
+
+// zohoSecret reads the HMAC shared secret from the environment.
+// The service refuses to start with an empty secret.
+func zohoSecret() string {
+	s := os.Getenv("ZOHO_WEBHOOK_SECRET")
+	if s == "" {
+		slog.Error("ZOHO_WEBHOOK_SECRET env var is required")
+		os.Exit(1)
+	}
+	return s
 }
