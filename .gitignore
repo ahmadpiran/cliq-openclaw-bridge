@@ -1,0 +1,36 @@
+# Compiled binaries and icons
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+
+# Main project binary
+# If you name your output specifically, add it here, e.g., /my-app
+app-out
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, created by `go test -coverprofile`
+*.out
+*.prof
+
+# Dependency directories
+# (Only needed if you use 'go mod vendor')
+# vendor/
+
+# IDE Specifics
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS Specifics
+.DS_Store
+Thumbs.db
+
+# Environment variables (Sensitive Info)
+.env
+.env.local
