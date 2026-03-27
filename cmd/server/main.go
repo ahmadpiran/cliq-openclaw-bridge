@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/store"
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 )
@@ -21,6 +22,20 @@ func main() {
 		Level: slog.LevelInfo,
 	}))
 	slog.SetDefault(logger)
+
+	// --- Token Store ---
+	tokenStore, err := store.NewTokenStore(dbPath())
+	if err != nil {
+		slog.Error("failed to open token store", "error", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if err := tokenStore.Close(); err != nil {
+			slog.Error("token store close error", "error", err)
+		}
+	}()
+
+	slog.Info("token store opened", "path", dbPath())
 
 	// --- Router ---
 	r := chi.NewRouter()
@@ -88,4 +103,12 @@ func listenAddr() string {
 		return ":" + port
 	}
 	return ":8080"
+}
+
+// dbPath returns the BoltDB file path from env, defaulting to a local file.
+func dbPath() string {
+	if p := os.Getenv("BOLT_DB_PATH"); p != "" {
+		return p
+	}
+	return "tokens.db"
 }
