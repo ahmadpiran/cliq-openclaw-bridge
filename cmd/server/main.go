@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 
+	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/gateway"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/handler"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/middleware"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/store"
@@ -39,10 +40,17 @@ func main() {
 	}()
 	slog.Info("token store opened", "path", dbPath())
 
-	// --- Worker Pool ---
+	// --- Gateway Client ---
+	gw := gateway.New(gateway.DefaultConfig(openclawBaseURL(), openclawAPIKey()))
+
+	// --- Worker Pool (replace the stub handler) ---
 	pool := worker.New(worker.DefaultConfig(), func(ctx context.Context, job worker.Job) error {
-		slog.Info("stub: job received", "request_id", job.RequestID)
-		return nil
+		return gw.Forward(ctx, gateway.ForwardRequest{
+			Source:     "zoho_cliq",
+			RequestID:  job.RequestID,
+			Payload:    job.Payload,
+			ReceivedAt: job.ReceivedAt,
+		})
 	})
 
 	// --- Handlers ---
@@ -127,4 +135,22 @@ func zohoSecret() string {
 		os.Exit(1)
 	}
 	return s
+}
+
+func openclawBaseURL() string {
+	u := os.Getenv("OPENCLAW_BASE_URL")
+	if u == "" {
+		slog.Error("OPENCLAW_BASE_URL env var is required")
+		os.Exit(1)
+	}
+	return u
+}
+
+func openclawAPIKey() string {
+	k := os.Getenv("OPENCLAW_API_KEY")
+	if k == "" {
+		slog.Error("OPENCLAW_API_KEY env var is required")
+		os.Exit(1)
+	}
+	return k
 }
