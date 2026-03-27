@@ -10,15 +10,16 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/middleware"
-	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/store"
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
+
+	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/middleware"
+	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/store"
+	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/worker"
 )
 
 func main() {
 	// --- Logger ---
-	// Structured JSON logging; swap to slog.NewTextHandler for local dev readability.
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
@@ -35,17 +36,21 @@ func main() {
 			slog.Error("token store close error", "error", err)
 		}
 	}()
-
 	slog.Info("token store opened", "path", dbPath())
+
+	// --- Worker Pool ---
+	pool := worker.New(worker.DefaultConfig(), func(ctx context.Context, job worker.Job) error {
+		slog.Info("stub: job received", "request_id", job.RequestID)
+		return nil
+	})
 
 	// --- Router ---
 	r := chi.NewRouter()
 
-	// Core middleware stack applied to every route.
-	r.Use(chimiddleware.RequestID)             // Injects X-Request-ID into every request context.
-	r.Use(chimiddleware.RealIP)                // Trusts X-Real-IP / X-Forwarded-For headers.
-	r.Use(chimiddleware.Recoverer)             // Catches panics in handlers, returns 500, logs stack trace.
-	r.Use(chimiddleware.Heartbeat("/healthz")) // Lightweight liveness probe; no auth, no logging.
+	r.Use(chimiddleware.RequestID)
+	r.Use(chimiddleware.RealIP)
+	r.Use(chimiddleware.Recoverer)
+	r.Use(chimiddleware.Heartbeat("/healthz"))
 
 	r.Route("/webhooks", func(r chi.Router) {
 		r.Use(middleware.ZohoHMAC(zohoSecret()))
@@ -59,12 +64,11 @@ func main() {
 		Addr:         listenAddr(),
 		Handler:      r,
 		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second, // Will be raised for streaming endpoints in Step 5.
+		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 
-	// --- Graceful Shutdown ---
-	// Run the server in a goroutine so the main goroutine can block on the signal channel.
+	// --- Start Server ---
 	serverErr := make(chan error, 1)
 	go func() {
 		slog.Info("server starting", "addr", srv.Addr)
@@ -73,6 +77,7 @@ func main() {
 		}
 	}()
 
+	// --- Signal Handling ---
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
@@ -84,20 +89,21 @@ func main() {
 		slog.Info("shutdown signal received", "signal", sig)
 	}
 
-	// Give in-flight requests up to 30 seconds to complete.
-	// This window will matter once the worker pool is draining.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// --- Graceful Shutdown ---
+	// Both srv.Shutdown and pool.Shutdown share the same 30s budget.
+	// HTTP stops accepting first, then the pool drains remaining jobs.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := srv.Shutdown(ctx); err != nil {
-		slog.Error("graceful shutdown failed", "error", err)
-		os.Exit(1)
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Error("http server shutdown error", "error", err)
 	}
+
+	pool.Shutdown(shutdownCtx)
 
 	slog.Info("server stopped cleanly")
 }
 
-// listenAddr returns the bind address from the PORT env var, defaulting to :8080.
 func listenAddr() string {
 	if port := os.Getenv("PORT"); port != "" {
 		return ":" + port
@@ -105,7 +111,6 @@ func listenAddr() string {
 	return ":8080"
 }
 
-// dbPath returns the BoltDB file path from env, defaulting to a local file.
 func dbPath() string {
 	if p := os.Getenv("BOLT_DB_PATH"); p != "" {
 		return p
@@ -113,8 +118,6 @@ func dbPath() string {
 	return "tokens.db"
 }
 
-// zohoSecret reads the HMAC shared secret from the environment.
-// The service refuses to start with an empty secret.
 func zohoSecret() string {
 	s := os.Getenv("ZOHO_WEBHOOK_SECRET")
 	if s == "" {
