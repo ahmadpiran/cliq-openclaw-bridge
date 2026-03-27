@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 
+	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/handler"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/middleware"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/store"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/worker"
@@ -44,6 +45,9 @@ func main() {
 		return nil
 	})
 
+	// --- Handlers ---
+	webhookHandler := handler.NewWebhookHandler(pool)
+
 	// --- Router ---
 	r := chi.NewRouter()
 
@@ -54,9 +58,7 @@ func main() {
 
 	r.Route("/webhooks", func(r chi.Router) {
 		r.Use(middleware.ZohoHMAC(zohoSecret()))
-		r.Post("/zoho", func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusNotImplemented)
-		})
+		r.Post("/zoho", webhookHandler.HandleZoho) // replaces the 501 stub
 	})
 
 	// --- HTTP Server ---
