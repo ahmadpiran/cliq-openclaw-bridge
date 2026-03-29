@@ -192,3 +192,66 @@ func TestValidToken_ZohoErrorResponse(t *testing.T) {
 		t.Fatal("expected error for Zoho error response, got nil")
 	}
 }
+
+func TestExchangeCode_Success(t *testing.T) {
+	var calls atomic.Int32
+	r, ts, _ := newTestRefresher(t, func(w http.ResponseWriter, req *http.Request) {
+		calls.Add(1)
+		// Confirm it's a code exchange, not a refresh.
+		if err := req.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+		}
+		if req.FormValue("grant_type") != "authorization_code" {
+			t.Errorf("unexpected grant_type: %s", req.FormValue("grant_type"))
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "initial-access",
+			"refresh_token": "initial-refresh",
+			"expires_in":    3600,
+		})
+	})
+
+	if err := r.ExchangeCode(context.Background(), "auth-code-abc", "https://example.com/callback"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	saved, err := ts.Load("zoho:test")
+	if err != nil {
+		t.Fatalf("load after exchange: %v", err)
+	}
+	if saved.AccessToken != "initial-access" || saved.RefreshToken != "initial-refresh" {
+		t.Errorf("unexpected saved token: %+v", saved)
+	}
+	if calls.Load() != 1 {
+		t.Errorf("expected 1 call, got %d", calls.Load())
+	}
+}
+
+func TestExchangeCode_ZohoReturnsError(t *testing.T) {
+	r, _, _ := newTestRefresher(t, func(w http.ResponseWriter, _ *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"error": "invalid_code",
+		})
+	})
+
+	err := r.ExchangeCode(context.Background(), "bad-code", "https://example.com/callback")
+	if err == nil {
+		t.Fatal("expected error for Zoho error response, got nil")
+	}
+}
+
+func TestExchangeCode_MissingTokensInResponse(t *testing.T) {
+	r, _, _ := newTestRefresher(t, func(w http.ResponseWriter, _ *http.Request) {
+		// Simulates Zoho returning a partial response.
+		json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "only-access",
+			// refresh_token deliberately missing
+			"expires_in": 3600,
+		})
+	})
+
+	err := r.ExchangeCode(context.Background(), "code-xyz", "https://example.com/callback")
+	if err == nil {
+		t.Fatal("expected error when refresh_token is absent, got nil")
+	}
+}

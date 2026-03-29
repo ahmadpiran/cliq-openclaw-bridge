@@ -40,16 +40,14 @@ type ServerConfig struct {
 
 // ZohoConfig holds Zoho Cliq integration credentials.
 type ZohoConfig struct {
-	// WebhookSecret is the HMAC shared secret for validating inbound webhooks.
 	WebhookSecret string
+	ClientID      string
+	ClientSecret  string
+	TokenKey      string
 
-	// ClientID and ClientSecret are the Zoho OAuth2 app credentials.
-	ClientID     string
-	ClientSecret string
-
-	// TokenKey is the BoltDB key under which the Zoho OAuth token is persisted.
-	// Defaults to "zoho:default" — override if you manage multiple Zoho orgs.
-	TokenKey string
+	// RedirectURI is the callback URL registered in your Zoho OAuth app.
+	// Required only during the initial token bootstrap flow.
+	RedirectURI string
 }
 
 // OpenClawConfig holds outbound gateway coordinates and retry policy.
@@ -115,6 +113,7 @@ func Load() (*Config, error) {
 		ClientID:      envRequired("ZOHO_CLIENT_ID", &errs),
 		ClientSecret:  envRequired("ZOHO_CLIENT_SECRET", &errs),
 		TokenKey:      envOr("ZOHO_TOKEN_KEY", "zoho:default"),
+		RedirectURI:   envOr("ZOHO_REDIRECT_URI", ""),
 	}
 
 	// --- OpenClaw ---

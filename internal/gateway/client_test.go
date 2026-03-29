@@ -147,11 +147,13 @@ func TestStreamFile_PipesDataWithoutBuffering(t *testing.T) {
 
 	client := newTestClient(t, openclawSrv.URL)
 
+	// In TestStreamFile_PipesDataWithoutBuffering, update the call site:
 	err := client.StreamFile(
 		context.Background(),
 		zohoSrv.URL+"/file/123",
 		"report.pdf",
 		"application/pdf",
+		"", // zohoToken — test server does not enforce auth
 	)
 	if err != nil {
 		t.Fatalf("StreamFile error: %v", err)

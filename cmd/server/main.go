@@ -48,7 +48,7 @@ func main() {
 	}()
 	slog.Info("token store opened", "path", cfg.Store.DBPath)
 
-	// --- Token Refresher ---
+	// --- Zoho Token Refresher ---
 	refresher := zoho.NewRefresher(zoho.RefresherConfig{
 		ClientID:     cfg.Zoho.ClientID,
 		ClientSecret: cfg.Zoho.ClientSecret,
@@ -65,24 +65,17 @@ func main() {
 		HTTPTimeout:    cfg.OpenClaw.HTTPTimeout,
 	})
 
-	_ = refresher
-
 	// --- Worker Pool ---
+	dispatcher := handler.NewDispatcher(gw, refresher)
 	pool := worker.New(worker.Config{
 		Workers:    cfg.Worker.Workers,
 		QueueDepth: cfg.Worker.QueueDepth,
 		JobTimeout: cfg.Worker.JobTimeout,
-	}, func(ctx context.Context, job worker.Job) error {
-		return gw.Forward(ctx, gateway.ForwardRequest{
-			Source:     "zoho_cliq",
-			RequestID:  job.RequestID,
-			Payload:    job.Payload,
-			ReceivedAt: job.ReceivedAt,
-		})
-	})
+	}, dispatcher.Dispatch)
 
 	// --- Handlers ---
 	webhookHandler := handler.NewWebhookHandler(pool)
+	oauthHandler := handler.NewOAuthHandler(refresher, cfg.Zoho.RedirectURI)
 
 	// --- Router ---
 	r := chi.NewRouter()
@@ -91,10 +84,14 @@ func main() {
 	r.Use(chimiddleware.Recoverer)
 	r.Use(chimiddleware.Heartbeat("/healthz"))
 
+	// Webhook route — HMAC validation applied to this group only.
 	r.Route("/webhooks", func(r chi.Router) {
 		r.Use(middleware.ZohoHMAC(cfg.Zoho.WebhookSecret))
 		r.Post("/zoho", webhookHandler.HandleZoho)
 	})
+
+	// OAuth callback — no HMAC middleware; this receives Zoho browser redirects.
+	r.Get("/oauth/callback", oauthHandler.HandleCallback)
 
 	// --- HTTP Server ---
 	srv := &http.Server{
@@ -105,7 +102,7 @@ func main() {
 		IdleTimeout:  cfg.Server.IdleTimeout,
 	}
 
-	// --- Start Server ---
+	// --- Start ---
 	serverErr := make(chan error, 1)
 	go func() {
 		slog.Info("server starting", "addr", srv.Addr)
@@ -127,6 +124,7 @@ func main() {
 	}
 
 	// --- Graceful Shutdown ---
+	// HTTP server stops accepting first, then the pool drains remaining jobs.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
 	defer cancel()
 

@@ -100,26 +100,21 @@ func (c *Client) Forward(ctx context.Context, req ForwardRequest) error {
 
 // StreamFile pipes a file from srcURL (a Zoho file download URL) directly to
 // the OpenClaw Workspace API without loading the file into memory.
-//
-// Data flow:
-//
-//	Zoho download → io.Pipe writer → io.Pipe reader → OpenClaw upload
-//
-// The pipe goroutine fetches from Zoho and writes chunks; the main goroutine
-// reads from the pipe and streams those same chunks upstream to OpenClaw.
-// Peak RAM usage is bounded by http.Transport's internal buffer (~32 KiB),
-// not by file size.
-func (c *Client) StreamFile(ctx context.Context, srcURL, filename, mimeType string) error {
+// zohoToken is a valid Zoho OAuth access token used to authenticate the download.
+func (c *Client) StreamFile(ctx context.Context, srcURL, filename, mimeType, zohoToken string) error {
 	pr, pw := io.Pipe()
 
-	// Goroutine: fetch from Zoho, write into the pipe.
 	go func() {
-		defer pw.Close() // Always close — signals EOF or propagates errors to the reader.
+		defer pw.Close()
 
 		dlReq, err := http.NewRequestWithContext(ctx, http.MethodGet, srcURL, nil)
 		if err != nil {
 			pw.CloseWithError(fmt.Errorf("build zoho download request: %w", err))
 			return
+		}
+		// Authenticate the download request with the caller-supplied Zoho token.
+		if zohoToken != "" {
+			dlReq.Header.Set("Authorization", "Zoho-oauthtoken "+zohoToken)
 		}
 
 		resp, err := c.http.Do(dlReq)
@@ -139,13 +134,12 @@ func (c *Client) StreamFile(ctx context.Context, srcURL, filename, mimeType stri
 		}
 	}()
 
-	// Main goroutine: read from the pipe, stream to OpenClaw.
 	return c.doWithRetry(ctx, func() (*http.Response, error) {
 		uploadReq, err := http.NewRequestWithContext(
 			ctx,
 			http.MethodPost,
 			c.cfg.BaseURL+"/workspace/files",
-			pr, // pr blocks until the goroutine above writes; no full-file buffer.
+			pr,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("build upload request: %w", err)

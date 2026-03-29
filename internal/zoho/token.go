@@ -16,35 +16,32 @@ import (
 )
 
 const (
-	// zohoTokenURL is the Zoho OAuth2 token endpoint.
-	zohoTokenURL = "https://accounts.zoho.com/oauth/v2/token"
-
-	// refreshTimeout is the per-attempt deadline for a token refresh call.
+	zohoTokenURL   = "https://accounts.zoho.com/oauth/v2/token"
 	refreshTimeout = 10 * time.Second
 )
 
-// zohoTokenResponse maps the JSON body Zoho returns on a successful refresh.
+// zohoTokenResponse maps the JSON Zoho returns on both code exchange and refresh.
 type zohoTokenResponse struct {
-	AccessToken string `json:"access_token"`
-	ExpiresIn   int    `json:"expires_in"` // seconds
-	TokenType   string `json:"token_type"`
-	Error       string `json:"error"` // non-empty on failure
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"` // Present on code exchange; empty on refresh.
+	ExpiresIn    int    `json:"expires_in"`
+	TokenType    string `json:"token_type"`
+	Error        string `json:"error"`
 }
 
-// RefresherConfig holds the credentials needed to refresh a Zoho OAuth token.
+// RefresherConfig holds the credentials needed to manage a Zoho OAuth token.
 type RefresherConfig struct {
 	ClientID     string
 	ClientSecret string
 	TokenKey     string
 
-	// TokenURL overrides the default Zoho token endpoint.
-	// Leave empty in production; set in tests to point at a fake server.
+	// TokenURL overrides the Zoho token endpoint. Leave empty in production;
+	// set in tests to point at a fake server.
 	TokenURL string
 }
 
 // Refresher manages the Zoho OAuth access token lifecycle.
-// It is safe for concurrent use — a mutex ensures only one refresh
-// runs at a time even when multiple workers detect expiry simultaneously.
+// It is safe for concurrent use.
 type Refresher struct {
 	cfg   RefresherConfig
 	store *store.TokenStore
@@ -61,25 +58,18 @@ func NewRefresher(cfg RefresherConfig, ts *store.TokenStore) *Refresher {
 	}
 }
 
-// ValidToken returns a valid access token, refreshing it first if necessary.
-// This is the only method the rest of the codebase should call.
-//
-// Concurrency model: if two workers simultaneously observe an expired token,
-// the mutex ensures only one refresh call is made to Zoho. The second worker
-// waits, then reads the token the first worker already refreshed.
+// ValidToken returns a valid Zoho access token, refreshing transparently if expired.
 func (r *Refresher) ValidToken(ctx context.Context) (string, error) {
-	// Optimistic read — no lock needed for a valid non-expired token.
+	// Optimistic read — no lock needed when the token is fresh.
 	t, err := r.store.Load(r.cfg.TokenKey)
 	if err == nil && !t.IsExpired() {
 		return t.AccessToken, nil
 	}
 
-	// Token is missing or expired — acquire the lock and refresh.
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Re-check after acquiring the lock: another goroutine may have
-	// already refreshed while we were waiting.
+	// Re-check after lock acquisition — another goroutine may have already refreshed.
 	t, err = r.store.Load(r.cfg.TokenKey)
 	if err == nil && !t.IsExpired() {
 		slog.Debug("token already refreshed by another worker")
@@ -107,9 +97,58 @@ func (r *Refresher) ValidToken(ctx context.Context) (string, error) {
 	return newToken.AccessToken, nil
 }
 
-// SaveInitialToken persists the first token obtained during the initial
-// OAuth authorization flow. Call this once after the user completes the
-// Zoho OAuth consent screen and you have a refresh token in hand.
+// ExchangeCode trades a Zoho authorization code for an access + refresh token pair
+// and persists it. Call this once after the user completes the OAuth consent screen.
+func (r *Refresher) ExchangeCode(ctx context.Context, code, redirectURI string) error {
+	body := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"client_id":     {r.cfg.ClientID},
+		"client_secret": {r.cfg.ClientSecret},
+		"redirect_uri":  {redirectURI},
+	}
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		r.tokenEndpoint(),
+		strings.NewReader(body.Encode()),
+	)
+	if err != nil {
+		return fmt.Errorf("build code exchange request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := r.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("code exchange request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return fmt.Errorf("read code exchange response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("code exchange status %d: %s", resp.StatusCode, string(raw))
+	}
+
+	var tr zohoTokenResponse
+	if err := json.Unmarshal(raw, &tr); err != nil {
+		return fmt.Errorf("decode code exchange response: %w", err)
+	}
+	if tr.Error != "" {
+		return fmt.Errorf("zoho code exchange error: %s", tr.Error)
+	}
+	if tr.AccessToken == "" || tr.RefreshToken == "" {
+		return fmt.Errorf("zoho code exchange: incomplete token response")
+	}
+
+	return r.SaveInitialToken(tr.AccessToken, tr.RefreshToken, tr.ExpiresIn)
+}
+
+// SaveInitialToken persists the first token pair obtained after OAuth consent.
 func (r *Refresher) SaveInitialToken(accessToken, refreshToken string, expiresIn int) error {
 	t := store.Token{
 		AccessToken:  accessToken,
@@ -119,8 +158,7 @@ func (r *Refresher) SaveInitialToken(accessToken, refreshToken string, expiresIn
 	return r.store.Save(r.cfg.TokenKey, t)
 }
 
-// refresh exchanges the refresh token for a new access token via Zoho's
-// OAuth2 token endpoint and returns the resulting store.Token.
+// refresh exchanges a refresh token for a new access token.
 func (r *Refresher) refresh(ctx context.Context, refreshToken string) (store.Token, error) {
 	if refreshToken == "" {
 		return store.Token{}, fmt.Errorf(
@@ -181,7 +219,7 @@ func (r *Refresher) refresh(ctx context.Context, refreshToken string) (store.Tok
 	}, nil
 }
 
-// tokenEndpoint returns the effective token URL, falling back to the Zoho default.
+// tokenEndpoint returns the effective token URL.
 func (r *Refresher) tokenEndpoint() string {
 	if r.cfg.TokenURL != "" {
 		return r.cfg.TokenURL
