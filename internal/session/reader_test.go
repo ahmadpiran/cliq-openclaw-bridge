@@ -61,3 +61,29 @@ func TestWaitForAssistantReply_Timeout(t *testing.T) {
 		t.Fatal("expected timeout error, got nil")
 	}
 }
+
+func TestFindLatestSessionFile(t *testing.T) {
+	dir := t.TempDir()
+	sessDir := filepath.Join(dir, "main", "sessions")
+	os.MkdirAll(sessDir, 0755)
+
+	// Old file — written before dispatch
+	old := filepath.Join(sessDir, "old.jsonl")
+	os.WriteFile(old, []byte(`{"type":"message"}`+"\n"), 0644)
+
+	before := time.Now()
+	time.Sleep(10 * time.Millisecond)
+
+	// New file — written after dispatch
+	newFile := filepath.Join(sessDir, "new.jsonl")
+	os.WriteFile(newFile, []byte(`{"type":"message"}`+"\n"), 0644)
+
+	r := session.NewReader(dir, "main")
+	got, err := r.FindLatestSessionFile(before)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != newFile {
+		t.Errorf("expected %s, got %s", newFile, got)
+	}
+}

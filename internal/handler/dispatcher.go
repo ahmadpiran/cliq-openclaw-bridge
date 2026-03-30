@@ -13,7 +13,7 @@ import (
 
 // SessionReader is satisfied by *session.Reader.
 type SessionReader interface {
-	SessionFile() (string, error)
+	FindLatestSessionFile(afterTime time.Time) (string, error)
 	WaitForAssistantReply(ctx context.Context, sessionFile string, afterTime time.Time) (string, error)
 }
 
@@ -99,7 +99,6 @@ func (d *Dispatcher) forward(ctx context.Context, job worker.Job, p zohoMessageP
 			p.Message.Sender, p.Message.ChannelTitle, p.Message.Text)
 	}
 
-	// Snapshot time just before dispatch — used to filter only new replies.
 	dispatchTime := time.Now()
 
 	if err := d.gw.Forward(ctx, gateway.ForwardRequest{
@@ -115,23 +114,27 @@ func (d *Dispatcher) forward(ctx context.Context, job worker.Job, p zohoMessageP
 	slog.Info("dispatcher: job forwarded to openclaw",
 		"request_id", job.RequestID)
 
-	// Reply-back is optional — skip if sender or reader is not configured.
 	if d.sender == nil || d.sessionReader == nil || p.Message.Channel == "" {
+		slog.Info("dispatcher: reply-back skipped",
+			"has_sender", d.sender != nil,
+			"has_reader", d.sessionReader != nil,
+			"channel", p.Message.Channel,
+		)
 		return nil
 	}
 
-	sessionFile, err := d.sessionReader.SessionFile()
+	// Give OpenClaw a moment to start writing before we scan for the file.
+	time.Sleep(1 * time.Second)
+
+	sessionFile, err := d.sessionReader.FindLatestSessionFile(dispatchTime)
 	if err != nil {
-		// Session file may not exist yet on the very first message.
-		// Wait briefly for OpenClaw to create it, then retry once.
-		time.Sleep(2 * time.Second)
-		sessionFile, err = d.sessionReader.SessionFile()
-		if err != nil {
-			slog.Error("dispatcher: session file not found, cannot reply",
-				"request_id", job.RequestID, "error", err)
-			return nil
-		}
+		slog.Error("dispatcher: session file not found",
+			"request_id", job.RequestID, "error", err)
+		return nil
 	}
+
+	slog.Info("dispatcher: found session file",
+		"request_id", job.RequestID, "file", sessionFile)
 
 	replyCtx, cancel := context.WithTimeout(ctx, d.replyTimeout)
 	defer cancel()
@@ -140,7 +143,7 @@ func (d *Dispatcher) forward(ctx context.Context, job worker.Job, p zohoMessageP
 	if err != nil {
 		slog.Error("dispatcher: timeout waiting for agent reply",
 			"request_id", job.RequestID, "error", err)
-		return nil // agent timeout is not a job failure
+		return nil
 	}
 
 	slog.Info("dispatcher: agent replied, posting to zoho cliq",

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -25,67 +24,58 @@ type jsonlEntry struct {
 }
 
 // Reader locates OpenClaw session JSONL files and extracts agent replies.
-// It is safe for concurrent use — all methods are read-only on disk.
 type Reader struct {
-	agentsDir string // e.g. /data/openclaw/agents
-	agentID   string // e.g. "main"
-
-	// cachedFile caches the resolved session file path after first discovery
-	// so we don't scan all files on every request.
-	cachedFile string
+	agentsDir string
+	agentID   string
 }
 
 // NewReader constructs a Reader.
-// agentsDir is the path to OpenClaw's agents directory inside the container.
 func NewReader(agentsDir, agentID string) *Reader {
 	return &Reader{agentsDir: agentsDir, agentID: agentID}
 }
 
-// SessionFile returns the JSONL file path for the hook:zoho-cliq session.
-// On first call it scans all session files; subsequent calls use the cached path.
-func (r *Reader) SessionFile() (string, error) {
-	if r.cachedFile != "" {
-		if _, err := os.Stat(r.cachedFile); err == nil {
-			return r.cachedFile, nil
-		}
-		// Cached file no longer exists — clear and re-scan.
-		r.cachedFile = ""
-	}
-
+// FindLatestSessionFile returns the JSONL file most recently modified
+// at or after afterTime. This reliably identifies which session file
+// OpenClaw wrote to for the current dispatch — even when there are
+// many session files from previous runs.
+func (r *Reader) FindLatestSessionFile(afterTime time.Time) (string, error) {
 	pattern := filepath.Join(r.agentsDir, r.agentID, "sessions", "*.jsonl")
 	files, err := filepath.Glob(pattern)
-	if err != nil || len(files) == 0 {
+	if err != nil {
+		return "", fmt.Errorf("glob session files: %w", err)
+	}
+	if len(files) == 0 {
 		return "", fmt.Errorf("no session files found in %s", pattern)
 	}
 
-	// Find the most recently modified file that contains our hook name.
 	var best string
 	var bestMod time.Time
+
 	for _, f := range files {
 		info, err := os.Stat(f)
 		if err != nil {
 			continue
 		}
-		if info.ModTime().Before(bestMod) {
+		mod := info.ModTime()
+		// Only consider files touched at or after the dispatch time.
+		if mod.Before(afterTime) {
 			continue
 		}
-		if fileContains(f, "Zoho Cliq") {
+		if mod.After(bestMod) {
 			best = f
-			bestMod = info.ModTime()
+			bestMod = mod
 		}
 	}
 
 	if best == "" {
-		return "", fmt.Errorf("no session file found containing Zoho Cliq content — " +
-			"send one message first so the session is created")
+		return "", fmt.Errorf("no session file modified after %s", afterTime.Format(time.RFC3339))
 	}
 
-	r.cachedFile = best
 	return best, nil
 }
 
-// WaitForAssistantReply polls sessionFile every 500ms until an assistant message
-// written after afterTime appears, or the context is cancelled.
+// WaitForAssistantReply polls sessionFile every 500ms until an assistant
+// message written after afterTime appears, or the context is cancelled.
 func (r *Reader) WaitForAssistantReply(ctx context.Context, sessionFile string, afterTime time.Time) (string, error) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -104,9 +94,8 @@ func (r *Reader) WaitForAssistantReply(ctx context.Context, sessionFile string, 
 	}
 }
 
-// lastAssistantMessage scans the JSONL file and returns the text of the most
-// recent assistant message written after afterTime. Returns ("", nil) when
-// no qualifying message has been written yet.
+// lastAssistantMessage scans the JSONL file and returns the text of the
+// most recent assistant message written after afterTime.
 func lastAssistantMessage(path string, afterTime time.Time) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -116,7 +105,7 @@ func lastAssistantMessage(path string, afterTime time.Time) (string, error) {
 
 	var result string
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 2<<20), 2<<20) // 2 MiB — handles long context lines
+	scanner.Buffer(make([]byte, 2<<20), 2<<20)
 
 	for scanner.Scan() {
 		var entry jsonlEntry
@@ -140,22 +129,4 @@ func lastAssistantMessage(path string, afterTime time.Time) (string, error) {
 	}
 
 	return result, scanner.Err()
-}
-
-// fileContains reports whether path contains substr on any line.
-func fileContains(path, substr string) bool {
-	f, err := os.Open(path)
-	if err != nil {
-		return false
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 2<<20), 2<<20)
-	for scanner.Scan() {
-		if strings.Contains(scanner.Text(), substr) {
-			return true
-		}
-	}
-	return false
 }

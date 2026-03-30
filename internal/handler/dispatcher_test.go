@@ -66,7 +66,7 @@ type fakeSessionReader struct {
 	calls    atomic.Int32
 }
 
-func (f *fakeSessionReader) SessionFile() (string, error) {
+func (f *fakeSessionReader) FindLatestSessionFile(_ time.Time) (string, error) {
 	return "fake.jsonl", f.fileErr
 }
 
