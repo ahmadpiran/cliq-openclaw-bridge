@@ -52,23 +52,14 @@ type ZohoConfig struct {
 
 // OpenClawConfig holds outbound gateway coordinates and retry policy.
 type OpenClawConfig struct {
-	// BaseURL is the OpenClaw API root, e.g. "https://api.openclaw.io/v1".
-	BaseURL string
-
-	// APIKey is the bearer token for OpenClaw authentication.
-	APIKey string
-
-	// MaxRetries is the number of additional attempts after the first failure.
-	MaxRetries int
-
-	// InitialBackoff is the wait before the first retry.
+	BaseURL        string
+	APIKey         string
+	MaxRetries     int
 	InitialBackoff time.Duration
-
-	// MaxBackoff caps the exponential growth.
-	MaxBackoff time.Duration
-
-	// HTTPTimeout is the per-attempt deadline for non-streaming requests.
-	HTTPTimeout time.Duration
+	MaxBackoff     time.Duration
+	HTTPTimeout    time.Duration
+	AgentsDir      string        // path to OpenClaw agents dir inside container
+	ReplyTimeout   time.Duration // how long to wait for agent reply
 }
 
 // StoreConfig holds BoltDB settings.
@@ -124,6 +115,8 @@ func Load() (*Config, error) {
 		InitialBackoff: envDuration("OPENCLAW_INITIAL_BACKOFF", 500*time.Millisecond),
 		MaxBackoff:     envDuration("OPENCLAW_MAX_BACKOFF", 30*time.Second),
 		HTTPTimeout:    envDuration("OPENCLAW_HTTP_TIMEOUT", 15*time.Second),
+		AgentsDir:      envOr("OPENCLAW_AGENTS_DIR", ""),
+		ReplyTimeout:   envDuration("OPENCLAW_REPLY_TIMEOUT", 60*time.Second),
 	}
 
 	// --- Store ---

@@ -5,10 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/gateway"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/worker"
 )
+
+// SessionReader is satisfied by *session.Reader.
+type SessionReader interface {
+	SessionFile() (string, error)
+	WaitForAssistantReply(ctx context.Context, sessionFile string, afterTime time.Time) (string, error)
+}
 
 // TokenProvider is satisfied by *zoho.Refresher.
 type TokenProvider interface {
@@ -21,9 +28,20 @@ type Forwarder interface {
 	StreamFile(ctx context.Context, srcURL, filename, mimeType, zohoToken string) error
 }
 
-// zohoAttachmentPayload is used to detect file attachments in the webhook body.
-type zohoAttachmentPayload struct {
-	Type       string `json:"type"`
+// ZohoSender is satisfied by *zoho.Sender.
+type ZohoSender interface {
+	PostToChannel(ctx context.Context, channelName, text string) error
+}
+
+// zohoMessagePayload extracts the fields we care about from the Zoho webhook body.
+type zohoMessagePayload struct {
+	Type    string `json:"type"`
+	Message struct {
+		Text         string `json:"text"`
+		Sender       string `json:"sender"`
+		Channel      string `json:"channel"`       // unique name — used for reply API call
+		ChannelTitle string `json:"channel_title"` // display title — for logs
+	} `json:"message"`
 	Attachment *struct {
 		DownloadURL string `json:"download_url"`
 		Name        string `json:"name"`
@@ -31,61 +49,117 @@ type zohoAttachmentPayload struct {
 	} `json:"attachment,omitempty"`
 }
 
-// Dispatcher routes jobs from the worker pool to the appropriate gateway path.
-// File attachments are streamed via io.Pipe; all other payloads are forwarded as JSON.
+// Dispatcher routes jobs from the worker pool.
 type Dispatcher struct {
-	gw        Forwarder
-	refresher TokenProvider
+	gw            Forwarder
+	refresher     TokenProvider
+	sender        ZohoSender    // nil = reply-back disabled
+	sessionReader SessionReader // nil = reply-back disabled
+	replyTimeout  time.Duration
 }
 
 // NewDispatcher constructs a Dispatcher.
-func NewDispatcher(gw Forwarder, refresher TokenProvider) *Dispatcher {
-	return &Dispatcher{gw: gw, refresher: refresher}
+// sender and sessionReader may be nil to disable reply-back.
+func NewDispatcher(
+	gw Forwarder,
+	refresher TokenProvider,
+	sender ZohoSender,
+	sessionReader SessionReader,
+	replyTimeout time.Duration,
+) *Dispatcher {
+	return &Dispatcher{
+		gw:            gw,
+		refresher:     refresher,
+		sender:        sender,
+		sessionReader: sessionReader,
+		replyTimeout:  replyTimeout,
+	}
 }
 
 // Dispatch is the worker.HandlerFunc passed to the pool.
-// It is the single entry point for all async job processing.
 func (d *Dispatcher) Dispatch(ctx context.Context, job worker.Job) error {
-	var p zohoAttachmentPayload
+	var p zohoMessagePayload
 	if err := json.Unmarshal(job.Payload, &p); err != nil {
-		// Unknown shape — forward raw and let OpenClaw decide.
-		slog.Warn("dispatcher: unrecognised payload shape, forwarding raw",
-			"request_id", job.RequestID,
-			"error", err,
-		)
-		return d.forward(ctx, job)
+		slog.Warn("dispatcher: unrecognised payload, forwarding raw",
+			"request_id", job.RequestID, "error", err)
+		return d.forwardRaw(ctx, job)
 	}
 
 	if p.Attachment != nil && p.Attachment.DownloadURL != "" {
 		return d.streamAttachment(ctx, job, p.Attachment)
 	}
 
-	return d.forward(ctx, job)
+	return d.forward(ctx, job, p)
 }
 
-func (d *Dispatcher) forward(ctx context.Context, job worker.Job) error {
-	var p struct {
-		Type    string `json:"type"`
-		Message struct {
-			Text    string `json:"text"`
-			Sender  string `json:"sender"`
-			Channel string `json:"channel"`
-		} `json:"message"`
-	}
-	_ = json.Unmarshal(job.Payload, &p)
-
+func (d *Dispatcher) forward(ctx context.Context, job worker.Job, p zohoMessagePayload) error {
 	message := string(job.Payload)
 	if p.Message.Text != "" {
-		message = fmt.Sprintf(
-			"[Zoho Cliq] %s wrote in #%s: %s",
-			p.Message.Sender,
-			p.Message.Channel,
-			p.Message.Text,
-		)
+		message = fmt.Sprintf("[Zoho Cliq] %s wrote in #%s: %s",
+			p.Message.Sender, p.Message.ChannelTitle, p.Message.Text)
 	}
 
-	return d.gw.Forward(ctx, gateway.ForwardRequest{
+	// Snapshot time just before dispatch — used to filter only new replies.
+	dispatchTime := time.Now()
+
+	if err := d.gw.Forward(ctx, gateway.ForwardRequest{
 		Message:    message,
+		Name:       "Zoho Cliq",
+		SessionKey: "hook:zoho-cliq",
+		RequestID:  job.RequestID,
+		ReceivedAt: job.ReceivedAt,
+	}); err != nil {
+		return fmt.Errorf("forward to openclaw: %w", err)
+	}
+
+	slog.Info("dispatcher: job forwarded to openclaw",
+		"request_id", job.RequestID)
+
+	// Reply-back is optional — skip if sender or reader is not configured.
+	if d.sender == nil || d.sessionReader == nil || p.Message.Channel == "" {
+		return nil
+	}
+
+	sessionFile, err := d.sessionReader.SessionFile()
+	if err != nil {
+		// Session file may not exist yet on the very first message.
+		// Wait briefly for OpenClaw to create it, then retry once.
+		time.Sleep(2 * time.Second)
+		sessionFile, err = d.sessionReader.SessionFile()
+		if err != nil {
+			slog.Error("dispatcher: session file not found, cannot reply",
+				"request_id", job.RequestID, "error", err)
+			return nil
+		}
+	}
+
+	replyCtx, cancel := context.WithTimeout(ctx, d.replyTimeout)
+	defer cancel()
+
+	reply, err := d.sessionReader.WaitForAssistantReply(replyCtx, sessionFile, dispatchTime)
+	if err != nil {
+		slog.Error("dispatcher: timeout waiting for agent reply",
+			"request_id", job.RequestID, "error", err)
+		return nil // agent timeout is not a job failure
+	}
+
+	slog.Info("dispatcher: agent replied, posting to zoho cliq",
+		"request_id", job.RequestID,
+		"channel", p.Message.Channel,
+		"reply_len", len(reply),
+	)
+
+	if err := d.sender.PostToChannel(ctx, p.Message.Channel, reply); err != nil {
+		slog.Error("dispatcher: failed to post reply",
+			"request_id", job.RequestID, "error", err)
+	}
+
+	return nil
+}
+
+func (d *Dispatcher) forwardRaw(ctx context.Context, job worker.Job) error {
+	return d.gw.Forward(ctx, gateway.ForwardRequest{
+		Message:    string(job.Payload),
 		Name:       "Zoho Cliq",
 		SessionKey: "hook:zoho-cliq",
 		RequestID:  job.RequestID,
@@ -106,12 +180,7 @@ func (d *Dispatcher) streamAttachment(
 	if err != nil {
 		return fmt.Errorf("get zoho token for file download: %w", err)
 	}
-
 	slog.Info("dispatcher: streaming file attachment",
-		"request_id", job.RequestID,
-		"filename", att.Name,
-		"mime_type", att.MimeType,
-	)
-
+		"request_id", job.RequestID, "filename", att.Name)
 	return d.gw.StreamFile(ctx, att.DownloadURL, att.Name, att.MimeType, token)
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/gateway"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/handler"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/middleware"
+	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/session"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/store"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/worker"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/zoho"
@@ -65,8 +66,26 @@ func main() {
 		HTTPTimeout:    cfg.OpenClaw.HTTPTimeout,
 	})
 
+	sender := zoho.NewSender(refresher, cfg.Zoho.CliqAPIURL)
+
+	// Session reader — nil if no agents dir configured.
+	var sessionReader handler.SessionReader
+	if cfg.OpenClaw.AgentsDir != "" {
+		sessionReader = session.NewReader(cfg.OpenClaw.AgentsDir, "main")
+		slog.Info("session reader configured", "agents_dir", cfg.OpenClaw.AgentsDir)
+	} else {
+		slog.Warn("OPENCLAW_AGENTS_DIR not set — reply-back disabled")
+	}
+
+	dispatcher := handler.NewDispatcher(
+		gw,
+		refresher,
+		sender,
+		sessionReader,
+		cfg.OpenClaw.ReplyTimeout,
+	)
+
 	// --- Worker Pool ---
-	dispatcher := handler.NewDispatcher(gw, refresher)
 	pool := worker.New(worker.Config{
 		Workers:    cfg.Worker.Workers,
 		QueueDepth: cfg.Worker.QueueDepth,
