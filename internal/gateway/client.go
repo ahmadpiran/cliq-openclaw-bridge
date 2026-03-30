@@ -13,13 +13,15 @@ import (
 	"time"
 )
 
-// ForwardRequest is the payload the gateway client sends to OpenClaw.
-// Extend this struct as the OpenClaw API contract evolves.
+// ForwardRequest is the payload OpenClaw's /hooks/agent endpoint expects.
 type ForwardRequest struct {
-	Source     string          `json:"source"` // Always "zoho_cliq"
-	RequestID  string          `json:"request_id"`
-	Payload    json.RawMessage `json:"payload"` // Raw Zoho webhook body, forwarded verbatim.
-	ReceivedAt time.Time       `json:"received_at"`
+	Message    string `json:"message"`
+	Name       string `json:"name"`
+	SessionKey string `json:"sessionKey,omitempty"`
+	Deliver    bool   `json:"deliver"`
+	// Internal fields — not serialised.
+	RequestID  string    `json:"-"`
+	ReceivedAt time.Time `json:"-"`
 }
 
 // Config holds the OpenClaw gateway coordinates and retry policy.
@@ -73,8 +75,6 @@ func New(cfg Config) *Client {
 	}
 }
 
-// Forward sends a processed webhook payload to the OpenClaw ingest endpoint.
-// It retries on transient failures using exponential backoff with full jitter.
 func (c *Client) Forward(ctx context.Context, req ForwardRequest) error {
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -85,7 +85,7 @@ func (c *Client) Forward(ctx context.Context, req ForwardRequest) error {
 		httpReq, err := http.NewRequestWithContext(
 			ctx,
 			http.MethodPost,
-			c.cfg.BaseURL+"/ingest",
+			c.cfg.BaseURL+"/hooks/agent",
 			bytes.NewReader(body),
 		)
 		if err != nil {

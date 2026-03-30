@@ -64,10 +64,32 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job worker.Job) error {
 }
 
 func (d *Dispatcher) forward(ctx context.Context, job worker.Job) error {
+	var p struct {
+		Type    string `json:"type"`
+		Message struct {
+			Text    string `json:"text"`
+			Sender  string `json:"sender"`
+			Channel string `json:"channel"`
+		} `json:"message"`
+	}
+	_ = json.Unmarshal(job.Payload, &p)
+
+	message := string(job.Payload)
+	if p.Message.Text != "" {
+		message = fmt.Sprintf(
+			"[Zoho Cliq] %s wrote in #%s: %s",
+			p.Message.Sender,
+			p.Message.Channel,
+			p.Message.Text,
+		)
+	}
+
 	return d.gw.Forward(ctx, gateway.ForwardRequest{
-		Source:     "zoho_cliq",
+		Message:    message,
+		Name:       "Zoho Cliq",
+		SessionKey: "hook:zoho-cliq",
+		Deliver:    false,
 		RequestID:  job.RequestID,
-		Payload:    job.Payload,
 		ReceivedAt: job.ReceivedAt,
 	})
 }
