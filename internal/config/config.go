@@ -44,10 +44,8 @@ type ZohoConfig struct {
 	ClientID      string
 	ClientSecret  string
 	TokenKey      string
-
-	// RedirectURI is the callback URL registered in your Zoho OAuth app.
-	// Required only during the initial token bootstrap flow.
-	RedirectURI string
+	RedirectURI   string
+	CliqAPIURL    string
 }
 
 // OpenClawConfig holds outbound gateway coordinates and retry policy.
@@ -105,6 +103,7 @@ func Load() (*Config, error) {
 		ClientSecret:  envRequired("ZOHO_CLIENT_SECRET", &errs),
 		TokenKey:      envOr("ZOHO_TOKEN_KEY", "zoho:default"),
 		RedirectURI:   envOr("ZOHO_REDIRECT_URI", ""),
+		CliqAPIURL:    envOr("ZOHO_CLIQ_API_URL", "https://cliq.zoho.com"),
 	}
 
 	// --- OpenClaw ---
