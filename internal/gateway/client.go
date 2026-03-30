@@ -18,7 +18,6 @@ type ForwardRequest struct {
 	Message    string `json:"message"`
 	Name       string `json:"name"`
 	SessionKey string `json:"sessionKey,omitempty"`
-	Deliver    bool   `json:"deliver"`
 	// Internal fields — not serialised.
 	RequestID  string    `json:"-"`
 	ReceivedAt time.Time `json:"-"`

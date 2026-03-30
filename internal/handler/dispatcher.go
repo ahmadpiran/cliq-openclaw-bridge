@@ -88,7 +88,6 @@ func (d *Dispatcher) forward(ctx context.Context, job worker.Job) error {
 		Message:    message,
 		Name:       "Zoho Cliq",
 		SessionKey: "hook:zoho-cliq",
-		Deliver:    false,
 		RequestID:  job.RequestID,
 		ReceivedAt: job.ReceivedAt,
 	})

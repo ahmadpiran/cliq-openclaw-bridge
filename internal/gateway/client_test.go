@@ -56,7 +56,6 @@ func TestForward_Success(t *testing.T) {
 		Message:    "[Zoho Cliq] Ross wrote in #general: hello",
 		Name:       "Zoho Cliq",
 		SessionKey: "hook:zoho-cliq",
-		Deliver:    false,
 		RequestID:  "req-001",
 		ReceivedAt: time.Now(),
 	})
@@ -167,7 +166,6 @@ func TestForward_InternalFieldsNotSerialised(t *testing.T) {
 		Message:    "field serialisation test",
 		Name:       "Zoho Cliq",
 		SessionKey: "hook:zoho-cliq",
-		Deliver:    false,
 		RequestID:  "should-not-appear",
 		ReceivedAt: time.Now(),
 	})
