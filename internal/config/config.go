@@ -23,6 +23,7 @@ type ServerConfig struct {
 	WriteTimeout    time.Duration
 	IdleTimeout     time.Duration
 	ShutdownTimeout time.Duration
+	NotifySecret    string // shared secret for POST /notify from OpenClaw hook
 }
 
 type ZohoConfig struct {
@@ -41,8 +42,6 @@ type OpenClawConfig struct {
 	InitialBackoff time.Duration
 	MaxBackoff     time.Duration
 	HTTPTimeout    time.Duration
-	AgentsDir      string
-	ReplyTimeout   time.Duration
 	WorkspaceDir   string
 }
 
@@ -67,6 +66,7 @@ func Load() (*Config, error) {
 		WriteTimeout:    envDuration("SERVER_WRITE_TIMEOUT", 10*time.Second),
 		IdleTimeout:     envDuration("SERVER_IDLE_TIMEOUT", 120*time.Second),
 		ShutdownTimeout: envDuration("SERVER_SHUTDOWN_TIMEOUT", 30*time.Second),
+		NotifySecret:    envRequired("BRIDGE_NOTIFY_SECRET", &errs),
 	}
 
 	cfg.Zoho = ZohoConfig{
@@ -85,8 +85,6 @@ func Load() (*Config, error) {
 		InitialBackoff: envDuration("OPENCLAW_INITIAL_BACKOFF", 500*time.Millisecond),
 		MaxBackoff:     envDuration("OPENCLAW_MAX_BACKOFF", 30*time.Second),
 		HTTPTimeout:    envDuration("OPENCLAW_HTTP_TIMEOUT", 15*time.Second),
-		AgentsDir:      envOr("OPENCLAW_AGENTS_DIR", ""),
-		ReplyTimeout:   envDuration("OPENCLAW_REPLY_TIMEOUT", 60*time.Second),
 		WorkspaceDir:   envOr("OPENCLAW_WORKSPACE_DIR", ""),
 	}
 

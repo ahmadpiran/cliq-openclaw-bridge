@@ -1,23 +1,26 @@
 services:
-  bridge:
-    build: .
+  cliq-bridge:
+    image: ${BRIDGE_IMAGE:-cliq-openclaw-bridge:local}
+    container_name: cliq-bridge
+    build:
+      context: ${BRIDGE_BUILD_CONTEXT:-./cliq-openclaw-bridge}
+      dockerfile: Dockerfile
     restart: unless-stopped
-    ports:
-      - "8080:8080"
     env_file:
-      - .env
+      - ${BRIDGE_ENV_FILE:-.bridge.env}
+    environment:
+      OPENCLAW_BASE_URL: http://openclaw-gateway:18789
     volumes:
-      # BoltDB must survive container restarts — never store it inside the container.
       - bridge-data:/data
-      - ${OPENCLAW_CONFIG_DIR}:/data/openclaw:ro
       - ${OPENCLAW_WORKSPACE_DIR}:/data/openclaw-workspace:rw
+    depends_on:
+      openclaw-gateway:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 5s
-
-volumes:
-  bridge-data:
-    driver: local
+    networks:
+      - cliq-bridge-net
