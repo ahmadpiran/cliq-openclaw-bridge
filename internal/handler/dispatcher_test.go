@@ -87,7 +87,7 @@ func newDispatcher(
 	sender handler.ZohoSender,
 	reader handler.SessionReader,
 ) *handler.Dispatcher {
-	return handler.NewDispatcher(gw, tp, sender, reader, "")
+	return handler.NewDispatcher(gw, tp, sender, reader, "", 5*time.Second)
 }
 
 func makeJob(t *testing.T, payload any) worker.Job {
@@ -139,7 +139,7 @@ func TestDispatcher_ForwardsRawWhenPayloadNotJSON(t *testing.T) {
 func TestDispatcher_DownloadsAndForwardsFileAttachment(t *testing.T) {
 	gw := &fakeForwarder{}
 	tp := &fakeTokenProvider{token: "zoho-tok-123"}
-	d := handler.NewDispatcher(gw, tp, nil, nil, "/tmp/workspace")
+	d := handler.NewDispatcher(gw, tp, nil, nil, "/tmp/workspace", 5*time.Second)
 
 	job := makeJob(t, map[string]any{
 		"type": "message",
@@ -168,7 +168,7 @@ func TestDispatcher_DownloadsAndForwardsFileAttachment(t *testing.T) {
 func TestDispatcher_ErrorWhenTokenProviderFails(t *testing.T) {
 	gw := &fakeForwarder{}
 	tp := &fakeTokenProvider{err: errors.New("bolt read error")}
-	d := handler.NewDispatcher(gw, tp, nil, nil, "/tmp/workspace")
+	d := handler.NewDispatcher(gw, tp, nil, nil, "/tmp/workspace", 5*time.Second)
 
 	job := makeJob(t, map[string]any{
 		"type": "message",
@@ -207,7 +207,7 @@ func TestDispatcher_PostsReplyToZohoCliqAfterAgentResponds(t *testing.T) {
 	}
 
 	// Give the goroutine time to post the reply.
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 
 	if gw.forwarded.Load() != 1 {
 		t.Errorf("expected 1 forward call, got %d", gw.forwarded.Load())
@@ -256,7 +256,6 @@ func TestDispatcher_NoReplyWhenChannelIsEmpty(t *testing.T) {
 		"message": map[string]any{
 			"text": "hi", "sender": "Ross",
 			"message_type": "text",
-			// channel deliberately absent
 		},
 	})
 
@@ -300,7 +299,7 @@ func TestDispatcher_ReplyBackSilentOnSenderFailure(t *testing.T) {
 	if err := d.Dispatch(context.Background(), job); err != nil {
 		t.Fatalf("sender failure should not fail the job, got: %v", err)
 	}
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 	if sender.sent.Load() != 1 {
 		t.Error("sender must have been called even though it errored")
 	}

@@ -105,6 +105,7 @@ func main() {
 		sender,
 		sessionReader,
 		cfg.OpenClaw.WorkspaceDir,
+		cfg.OpenClaw.ReplyTimeout,
 	)
 
 	pool := worker.New(worker.Config{

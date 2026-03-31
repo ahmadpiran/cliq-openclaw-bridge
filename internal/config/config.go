@@ -99,7 +99,7 @@ func Load() (*Config, error) {
 	cfg.Worker = WorkerConfig{
 		Workers:    envInt("WORKER_COUNT", 8),
 		QueueDepth: envInt("WORKER_QUEUE_DEPTH", 512),
-		JobTimeout: envDuration("WORKER_JOB_TIMEOUT", 150*time.Second),
+		JobTimeout: envDuration("WORKER_JOB_TIMEOUT", 90*time.Second),
 	}
 
 	if len(errs) > 0 {

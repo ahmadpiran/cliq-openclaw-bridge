@@ -20,11 +20,12 @@ func setEnv(t *testing.T, pairs map[string]string) {
 func minimalEnv(t *testing.T) {
 	t.Helper()
 	setEnv(t, map[string]string{
-		"ZOHO_WEBHOOK_SECRET": "secret",
-		"ZOHO_CLIENT_ID":      "client-id",
-		"ZOHO_CLIENT_SECRET":  "client-secret",
-		"OPENCLAW_BASE_URL":   "https://api.openclaw.io/v1",
-		"OPENCLAW_API_KEY":    "oc-key",
+		"ZOHO_WEBHOOK_SECRET":  "secret",
+		"ZOHO_CLIENT_ID":       "client-id",
+		"ZOHO_CLIENT_SECRET":   "client-secret",
+		"OPENCLAW_BASE_URL":    "https://api.openclaw.io/v1",
+		"OPENCLAW_API_KEY":     "oc-key",
+		"BRIDGE_NOTIFY_SECRET": "notify-secret",
 	})
 }
 
@@ -135,8 +136,8 @@ func TestLoad_InvalidDurationFallsBackToDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.Worker.JobTimeout != 90*time.Second {
-		t.Errorf("expected default 90s job timeout on bad input, got %s", cfg.Worker.JobTimeout)
+	if cfg.Worker.JobTimeout != 150*time.Second {
+		t.Errorf("expected default 150s job timeout on bad input, got %s", cfg.Worker.JobTimeout)
 	}
 }
 

@@ -11,29 +11,24 @@ import (
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/worker"
 )
 
-// TokenProvider is satisfied by *zoho.Refresher.
 type TokenProvider interface {
 	ValidToken(ctx context.Context) (string, error)
 }
 
-// Forwarder is satisfied by *gateway.Client.
 type Forwarder interface {
 	Forward(ctx context.Context, req gateway.ForwardRequest) error
 	DownloadAndForward(ctx context.Context, srcURL, filename, mimeType, zohoToken, comment, sessionKey, workspaceDir string) error
 }
 
-// ZohoSender is satisfied by *zoho.Sender.
 type ZohoSender interface {
 	PostToChannel(ctx context.Context, chatID, text string) error
 }
 
-// SessionReader is satisfied by *session.Reader.
 type SessionReader interface {
 	FindLatestSessionFile(afterTime time.Time) (string, error)
 	TailAssistantMessages(ctx context.Context, sessionFile string, afterTime time.Time, out chan<- string)
 }
 
-// zohoMessagePayload is the structure the Deluge script sends to the bridge.
 type zohoMessagePayload struct {
 	Type    string `json:"type"`
 	Message struct {
@@ -49,24 +44,24 @@ type zohoMessagePayload struct {
 }
 
 // Dispatcher routes jobs from the worker pool to the correct processing path.
-// Reply-back runs in a background goroutine so the worker is freed immediately
-// after forwarding — long-running tool chains and approvals are handled without
-// blocking the pool.
+// Reply-back runs in its own goroutine with an independent context so that
+// the worker job context expiring does not kill the reply watcher.
 type Dispatcher struct {
 	gw            Forwarder
 	refresher     TokenProvider
 	sender        ZohoSender
 	sessionReader SessionReader
 	workspaceDir  string
+	replyTimeout  time.Duration
 }
 
-// NewDispatcher constructs a Dispatcher.
 func NewDispatcher(
 	gw Forwarder,
 	refresher TokenProvider,
 	sender ZohoSender,
 	sessionReader SessionReader,
 	workspaceDir string,
+	replyTimeout time.Duration,
 ) *Dispatcher {
 	return &Dispatcher{
 		gw:            gw,
@@ -74,12 +69,10 @@ func NewDispatcher(
 		sender:        sender,
 		sessionReader: sessionReader,
 		workspaceDir:  workspaceDir,
+		replyTimeout:  replyTimeout,
 	}
 }
 
-// Dispatch is the worker.HandlerFunc passed to the pool.
-// It forwards the message and returns immediately. Reply-back runs
-// in a goroutine that tails the session file until the context expires.
 func (d *Dispatcher) Dispatch(ctx context.Context, job worker.Job) error {
 	var p zohoMessagePayload
 	if err := json.Unmarshal(job.Payload, &p); err != nil {
@@ -95,7 +88,6 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job worker.Job) error {
 	return d.forward(ctx, job, p)
 }
 
-// forward sends a text message to OpenClaw and launches reply-back in background.
 func (d *Dispatcher) forward(ctx context.Context, job worker.Job, p zohoMessagePayload) error {
 	message := string(job.Payload)
 	if p.Message.Text != "" {
@@ -118,15 +110,13 @@ func (d *Dispatcher) forward(ctx context.Context, job worker.Job, p zohoMessageP
 	slog.Info("dispatcher: job forwarded to openclaw",
 		"request_id", job.RequestID)
 
-	// Launch reply-back in a goroutine — job returns immediately to the pool.
-	// The goroutine tails the session file until ctx expires (WORKER_JOB_TIMEOUT).
-	// No idle timeout: tool approvals and long-running tasks all come through.
-	go d.postReply(ctx, job.RequestID, p.Message.Channel, dispatchTime)
+	// postReply gets its own context — independent of the worker job context
+	// which is cancelled as soon as Dispatch returns.
+	go d.postReply(job.RequestID, p.Message.Channel, dispatchTime)
 
 	return nil
 }
 
-// handleFile downloads the file to workspace and asks the agent to process it.
 func (d *Dispatcher) handleFile(ctx context.Context, job worker.Job, msg struct {
 	Text           string `json:"text"`
 	Sender         string `json:"sender"`
@@ -172,16 +162,15 @@ func (d *Dispatcher) handleFile(ctx context.Context, job worker.Job, msg struct 
 	slog.Info("dispatcher: file forwarded to openclaw",
 		"request_id", job.RequestID)
 
-	go d.postReply(ctx, job.RequestID, msg.Channel, dispatchTime)
+	go d.postReply(job.RequestID, msg.Channel, dispatchTime)
 
 	return nil
 }
 
-// postReply runs in a goroutine. It waits for the session file to appear,
-// then tails it — posting every new assistant message to Zoho Cliq until
-// ctx is cancelled. ctx comes from the worker pool and expires at WORKER_JOB_TIMEOUT,
-// which is the only deadline. There is no idle timeout.
-func (d *Dispatcher) postReply(ctx context.Context, requestID, channel string, afterTime time.Time) {
+// postReply runs in a goroutine with its own context derived from Background.
+// This is critical — the worker job context is cancelled when Dispatch returns,
+// so we must not use it here.
+func (d *Dispatcher) postReply(requestID, channel string, afterTime time.Time) {
 	if d.sender == nil || d.sessionReader == nil || channel == "" {
 		slog.Info("dispatcher: reply-back skipped",
 			"has_sender", d.sender != nil,
@@ -191,6 +180,10 @@ func (d *Dispatcher) postReply(ctx context.Context, requestID, channel string, a
 		return
 	}
 
+	// Independent context — lives for replyTimeout regardless of job lifecycle.
+	ctx, cancel := context.WithTimeout(context.Background(), d.replyTimeout)
+	defer cancel()
+
 	// Poll until session file appears.
 	fileTicker := time.NewTicker(1 * time.Second)
 	defer fileTicker.Stop()
@@ -199,6 +192,8 @@ func (d *Dispatcher) postReply(ctx context.Context, requestID, channel string, a
 	for {
 		select {
 		case <-ctx.Done():
+			slog.Warn("dispatcher: timed out waiting for session file",
+				"request_id", requestID)
 			return
 		case <-fileTicker.C:
 			f, err := d.sessionReader.FindLatestSessionFile(afterTime)
@@ -235,14 +230,13 @@ found:
 					"request_id", requestID, "error", err)
 			}
 		case <-ctx.Done():
-			slog.Info("dispatcher: reply goroutine context expired",
+			slog.Info("dispatcher: reply timeout reached",
 				"request_id", requestID)
 			return
 		}
 	}
 }
 
-// forwardRaw forwards an unrecognised payload without reply-back.
 func (d *Dispatcher) forwardRaw(ctx context.Context, job worker.Job) error {
 	return d.gw.Forward(ctx, gateway.ForwardRequest{
 		Message:    string(job.Payload),
