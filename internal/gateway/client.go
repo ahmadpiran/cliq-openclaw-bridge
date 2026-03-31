@@ -56,9 +56,18 @@ func New(cfg Config) *Client {
 	}
 }
 
-// Forward sends a message to OpenClaw's /hooks/agent endpoint.
 func (c *Client) Forward(ctx context.Context, req ForwardRequest) error {
-	body, err := json.Marshal(req)
+	body, err := json.Marshal(struct {
+		Message    string `json:"message"`
+		Name       string `json:"name"`
+		SessionKey string `json:"sessionKey,omitempty"`
+		Deliver    bool   `json:"deliver"`
+	}{
+		Message:    req.Message,
+		Name:       req.Name,
+		SessionKey: req.SessionKey,
+		Deliver:    true,
+	})
 	if err != nil {
 		return fmt.Errorf("marshal forward request: %w", err)
 	}
