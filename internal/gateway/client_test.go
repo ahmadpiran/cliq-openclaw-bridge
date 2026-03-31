@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -202,38 +203,59 @@ func TestForward_SessionKeyOmittedWhenEmpty(t *testing.T) {
 	}
 }
 
-func TestStreamFile_PipesDataWithoutBuffering(t *testing.T) {
+func TestDownloadAndForward_SavesFileAndForwards(t *testing.T) {
 	const fileContent = "hello from zoho file attachment"
 
+	// Simulate Zoho file download endpoint.
 	zohoSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		io.WriteString(w, fileContent)
 	}))
 	defer zohoSrv.Close()
 
-	var received string
+	// Simulate OpenClaw /hooks/agent endpoint.
+	var receivedMessage string
 	openclawSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/workspace/files" {
-			t.Errorf("unexpected path: %s", r.URL.Path)
-		}
-		b, _ := io.ReadAll(r.Body)
-		received = string(b)
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		receivedMessage, _ = body["message"].(string)
 		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok":true,"runId":"test-run"}`))
 	}))
 	defer openclawSrv.Close()
 
+	workspaceDir := t.TempDir()
 	client := newTestClient(t, openclawSrv.URL)
-	err := client.StreamFile(
+
+	err := client.DownloadAndForward(
 		context.Background(),
 		zohoSrv.URL+"/file/123",
-		"report.pdf",
-		"application/pdf",
-		"",
+		"report.txt",
+		"text/plain",
+		"",               // zohoToken
+		"please review",  // comment
+		"hook:zoho-cliq", // sessionKey
+		workspaceDir,
 	)
 	if err != nil {
-		t.Fatalf("StreamFile error: %v", err)
+		t.Fatalf("DownloadAndForward error: %v", err)
 	}
-	if !strings.Contains(received, fileContent) {
-		t.Errorf("OpenClaw did not receive the file content; got: %q", received)
+
+	// Confirm the file was written to the workspace.
+	savedPath := workspaceDir + "/uploads/report.txt"
+	data, err := os.ReadFile(savedPath)
+	if err != nil {
+		t.Fatalf("expected file to be saved at %s: %v", savedPath, err)
+	}
+	if string(data) != fileContent {
+		t.Errorf("file content mismatch: got %q", string(data))
+	}
+
+	// Confirm the agent received a message referencing the file path.
+	if !strings.Contains(receivedMessage, "report.txt") {
+		t.Errorf("agent message should reference filename, got: %q", receivedMessage)
+	}
+	if !strings.Contains(receivedMessage, "please review") {
+		t.Errorf("agent message should include comment, got: %q", receivedMessage)
 	}
 }

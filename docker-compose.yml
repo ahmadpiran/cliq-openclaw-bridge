@@ -10,6 +10,7 @@ services:
       # BoltDB must survive container restarts — never store it inside the container.
       - bridge-data:/data
       - ${OPENCLAW_CONFIG_DIR}:/data/openclaw:ro
+      - ${OPENCLAW_WORKSPACE_DIR}:/data/openclaw-workspace:rw
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
       interval: 30s

@@ -16,12 +16,10 @@ import (
 // --- fakes ---
 
 type fakeForwarder struct {
-	forwardErr   error
-	streamErr    error
-	forwarded    atomic.Int32
-	streamed     atomic.Int32
-	lastFilename string
-	lastToken    string
+	forwardErr     error
+	forwardFileErr error
+	forwarded      atomic.Int32
+	fileForwarded  atomic.Int32
 }
 
 func (f *fakeForwarder) Forward(_ context.Context, _ gateway.ForwardRequest) error {
@@ -29,11 +27,9 @@ func (f *fakeForwarder) Forward(_ context.Context, _ gateway.ForwardRequest) err
 	return f.forwardErr
 }
 
-func (f *fakeForwarder) StreamFile(_ context.Context, _, filename, _, zohoToken string) error {
-	f.streamed.Add(1)
-	f.lastFilename = filename
-	f.lastToken = zohoToken
-	return f.streamErr
+func (f *fakeForwarder) DownloadAndForward(_ context.Context, _, _, _, _, _, _, _ string) error {
+	f.fileForwarded.Add(1)
+	return f.forwardFileErr
 }
 
 type fakeTokenProvider struct {
@@ -87,7 +83,7 @@ func newDispatcher(
 	if replyTimeout == 0 {
 		replyTimeout = 5 * time.Second
 	}
-	return handler.NewDispatcher(gw, tp, sender, reader, replyTimeout)
+	return handler.NewDispatcher(gw, tp, sender, reader, replyTimeout, "")
 }
 
 func makeJob(t *testing.T, payload any) worker.Job {
@@ -105,16 +101,21 @@ func TestDispatcher_ForwardsPlainPayload(t *testing.T) {
 	gw := &fakeForwarder{}
 	d := newDispatcher(gw, &fakeTokenProvider{}, nil, nil, 0)
 
-	job := makeJob(t, map[string]any{"type": "message", "message": map[string]any{"text": "hello", "sender": "Ross"}})
+	job := makeJob(t, map[string]any{
+		"type": "message",
+		"message": map[string]any{
+			"text": "hello", "sender": "Ross",
+			"message_type": "text",
+		},
+	})
 	if err := d.Dispatch(context.Background(), job); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
 	if gw.forwarded.Load() != 1 {
 		t.Errorf("expected 1 forward call, got %d", gw.forwarded.Load())
 	}
-	if gw.streamed.Load() != 0 {
-		t.Error("stream must not be called for a plain message")
+	if gw.fileForwarded.Load() != 0 {
+		t.Error("DownloadAndForward must not be called for plain text")
 	}
 }
 
@@ -126,55 +127,52 @@ func TestDispatcher_ForwardsRawWhenPayloadNotJSON(t *testing.T) {
 	if err := d.Dispatch(context.Background(), job); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
 	if gw.forwarded.Load() != 1 {
 		t.Errorf("expected raw payload to be forwarded, got %d forwards", gw.forwarded.Load())
 	}
 }
 
-func TestDispatcher_StreamsFileAttachment(t *testing.T) {
+func TestDispatcher_DownloadsAndForwardsFileAttachment(t *testing.T) {
 	gw := &fakeForwarder{}
 	tp := &fakeTokenProvider{token: "zoho-tok-123"}
-	d := newDispatcher(gw, tp, nil, nil, 0)
+	d := handler.NewDispatcher(gw, tp, nil, nil, 5*time.Second, "/tmp/workspace")
 
 	job := makeJob(t, map[string]any{
 		"type": "message",
-		"attachment": map[string]any{
-			"download_url": "https://zoho.example.com/file/42",
-			"name":         "report.pdf",
-			"mime_type":    "application/pdf",
+		"message": map[string]any{
+			"text":            "check this file",
+			"sender":          "Ross",
+			"channel":         "CT_123",
+			"message_type":    "file",
+			"attachment_url":  "https://zoho.example.com/file/42",
+			"attachment_name": "report.pdf",
+			"attachment_mime": "application/pdf",
 		},
 	})
 
 	if err := d.Dispatch(context.Background(), job); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
-	if gw.streamed.Load() != 1 {
-		t.Errorf("expected 1 stream call, got %d", gw.streamed.Load())
+	if gw.fileForwarded.Load() != 1 {
+		t.Errorf("expected 1 DownloadAndForward call, got %d", gw.fileForwarded.Load())
 	}
 	if gw.forwarded.Load() != 0 {
-		t.Error("forward must not be called for an attachment payload")
-	}
-	if gw.lastFilename != "report.pdf" {
-		t.Errorf("unexpected filename: %s", gw.lastFilename)
-	}
-	if gw.lastToken != "zoho-tok-123" {
-		t.Errorf("unexpected token: %s", gw.lastToken)
+		t.Error("Forward must not be called directly for file attachments")
 	}
 }
 
 func TestDispatcher_ErrorWhenTokenProviderFails(t *testing.T) {
 	gw := &fakeForwarder{}
 	tp := &fakeTokenProvider{err: errors.New("bolt read error")}
-	d := newDispatcher(gw, tp, nil, nil, 0)
+	d := handler.NewDispatcher(gw, tp, nil, nil, 5*time.Second, "/tmp/workspace")
 
 	job := makeJob(t, map[string]any{
 		"type": "message",
-		"attachment": map[string]any{
-			"download_url": "https://zoho.example.com/file/99",
-			"name":         "file.zip",
-			"mime_type":    "application/zip",
+		"message": map[string]any{
+			"message_type":    "file",
+			"attachment_url":  "https://zoho.example.com/file/99",
+			"attachment_name": "file.zip",
+			"attachment_mime": "application/zip",
 		},
 	})
 
@@ -195,22 +193,22 @@ func TestDispatcher_PostsReplyToZohoCliqAfterAgentResponds(t *testing.T) {
 		"message": map[string]any{
 			"text":          "hi",
 			"sender":        "Ross",
-			"channel":       "openclaw-bridge-op3",
-			"channel_title": "OpenClaw Bridge OP3",
+			"channel":       "CT_123",
+			"channel_title": "Test Channel",
+			"message_type":  "text",
 		},
 	})
 
 	if err := d.Dispatch(context.Background(), job); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
 	if gw.forwarded.Load() != 1 {
 		t.Errorf("expected 1 forward call, got %d", gw.forwarded.Load())
 	}
 	if sender.sent.Load() != 1 {
 		t.Errorf("expected 1 reply sent, got %d", sender.sent.Load())
 	}
-	if sender.lastChannel != "openclaw-bridge-op3" {
+	if sender.lastChannel != "CT_123" {
 		t.Errorf("wrong channel: %s", sender.lastChannel)
 	}
 	if sender.lastText != "Hey Ross! 👋" {
@@ -221,23 +219,19 @@ func TestDispatcher_PostsReplyToZohoCliqAfterAgentResponds(t *testing.T) {
 func TestDispatcher_NoReplyWhenSenderIsNil(t *testing.T) {
 	gw := &fakeForwarder{}
 	reader := &fakeSessionReader{reply: "some reply"}
-
-	// sender = nil means reply-back is disabled
 	d := newDispatcher(gw, &fakeTokenProvider{}, nil, reader, 5*time.Second)
 
 	job := makeJob(t, map[string]any{
 		"type": "message",
 		"message": map[string]any{
-			"text":    "hi",
-			"sender":  "Ross",
-			"channel": "test-channel",
+			"text": "hi", "sender": "Ross",
+			"channel": "CT_123", "message_type": "text",
 		},
 	})
 
 	if err := d.Dispatch(context.Background(), job); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
 	if reader.calls.Load() != 0 {
 		t.Error("session reader must not be called when sender is nil")
 	}
@@ -247,15 +241,13 @@ func TestDispatcher_NoReplyWhenChannelIsEmpty(t *testing.T) {
 	gw := &fakeForwarder{}
 	sender := &fakeZohoSender{}
 	reader := &fakeSessionReader{reply: "some reply"}
-
 	d := newDispatcher(gw, &fakeTokenProvider{}, sender, reader, 5*time.Second)
 
-	// No channel field — cannot reply back
 	job := makeJob(t, map[string]any{
 		"type": "message",
 		"message": map[string]any{
-			"text":   "hi",
-			"sender": "Ross",
+			"text": "hi", "sender": "Ross",
+			"message_type": "text",
 			// channel deliberately absent
 		},
 	})
@@ -263,7 +255,6 @@ func TestDispatcher_NoReplyWhenChannelIsEmpty(t *testing.T) {
 	if err := d.Dispatch(context.Background(), job); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
 	if sender.sent.Load() != 0 {
 		t.Error("reply must not be sent when channel is empty")
 	}
@@ -272,25 +263,20 @@ func TestDispatcher_NoReplyWhenChannelIsEmpty(t *testing.T) {
 func TestDispatcher_ReplyBackSilentOnAgentTimeout(t *testing.T) {
 	gw := &fakeForwarder{}
 	sender := &fakeZohoSender{}
-	// Reader times out — returns an error simulating no agent reply within window.
 	reader := &fakeSessionReader{replyErr: context.DeadlineExceeded}
-
 	d := newDispatcher(gw, &fakeTokenProvider{}, sender, reader, 5*time.Second)
 
 	job := makeJob(t, map[string]any{
 		"type": "message",
 		"message": map[string]any{
-			"text":    "hi",
-			"sender":  "Ross",
-			"channel": "test-channel",
+			"text": "hi", "sender": "Ross",
+			"channel": "CT_123", "message_type": "text",
 		},
 	})
 
-	// Agent timeout must not fail the job — it is a soft error.
 	if err := d.Dispatch(context.Background(), job); err != nil {
 		t.Fatalf("agent timeout should not fail the job, got: %v", err)
 	}
-
 	if gw.forwarded.Load() != 1 {
 		t.Errorf("expected 1 forward call regardless of reply timeout")
 	}
@@ -303,23 +289,19 @@ func TestDispatcher_ReplyBackSilentOnSenderFailure(t *testing.T) {
 	gw := &fakeForwarder{}
 	sender := &fakeZohoSender{err: errors.New("zoho api down")}
 	reader := &fakeSessionReader{reply: "Hey!"}
-
 	d := newDispatcher(gw, &fakeTokenProvider{}, sender, reader, 5*time.Second)
 
 	job := makeJob(t, map[string]any{
 		"type": "message",
 		"message": map[string]any{
-			"text":    "hi",
-			"sender":  "Ross",
-			"channel": "test-channel",
+			"text": "hi", "sender": "Ross",
+			"channel": "CT_123", "message_type": "text",
 		},
 	})
 
-	// Sender failure must not fail the job — the agent ran successfully.
 	if err := d.Dispatch(context.Background(), job); err != nil {
 		t.Fatalf("sender failure should not fail the job, got: %v", err)
 	}
-
 	if sender.sent.Load() != 1 {
 		t.Error("sender must have been called even though it errored")
 	}

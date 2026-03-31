@@ -25,7 +25,7 @@ import (
 func main() {
 	// --- Logger ---
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelDebug, // temporary
+		Level: slog.LevelInfo,
 	}))
 	slog.SetDefault(logger)
 
@@ -50,8 +50,7 @@ func main() {
 	slog.Info("token store opened", "path", cfg.Store.DBPath)
 
 	// --- Zoho Token Refresher ---
-	// For file attachment downloads even though reply-back
-	// now uses a webhook token instead of OAuth.
+	// Used for authenticating Zoho file downloads.
 	refresher := zoho.NewRefresher(zoho.RefresherConfig{
 		ClientID:     cfg.Zoho.ClientID,
 		ClientSecret: cfg.Zoho.ClientSecret,
@@ -79,13 +78,19 @@ func main() {
 	}
 
 	// --- Session Reader ---
-	// Reads OpenClaw JSONL session files to extract agent replies.
 	var sessionReader handler.SessionReader
 	if cfg.OpenClaw.AgentsDir != "" {
 		sessionReader = session.NewReader(cfg.OpenClaw.AgentsDir, "main")
 		slog.Info("session reader configured", "agents_dir", cfg.OpenClaw.AgentsDir)
 	} else {
 		slog.Warn("OPENCLAW_AGENTS_DIR not set — reply-back disabled")
+	}
+
+	// --- Workspace Dir ---
+	if cfg.OpenClaw.WorkspaceDir != "" {
+		slog.Info("workspace dir configured", "workspace_dir", cfg.OpenClaw.WorkspaceDir)
+	} else {
+		slog.Warn("OPENCLAW_WORKSPACE_DIR not set — file uploads disabled")
 	}
 
 	// --- Worker Pool ---
@@ -95,6 +100,7 @@ func main() {
 		sender,
 		sessionReader,
 		cfg.OpenClaw.ReplyTimeout,
+		cfg.OpenClaw.WorkspaceDir,
 	)
 
 	pool := worker.New(worker.Config{
@@ -114,13 +120,11 @@ func main() {
 	r.Use(chimiddleware.Recoverer)
 	r.Use(chimiddleware.Heartbeat("/healthz"))
 
-	// Webhook route — HMAC token validation applied to this group only.
 	r.Route("/webhooks", func(r chi.Router) {
 		r.Use(middleware.ZohoHMAC(cfg.Zoho.WebhookSecret))
 		r.Post("/zoho", webhookHandler.HandleZoho)
 	})
 
-	// OAuth callback — used only during initial token bootstrap for file downloads.
 	r.Get("/oauth/callback", oauthHandler.HandleCallback)
 
 	// --- HTTP Server ---
@@ -154,7 +158,6 @@ func main() {
 	}
 
 	// --- Graceful Shutdown ---
-	// HTTP server stops accepting first, then the pool drains remaining jobs.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
 	defer cancel()
 
