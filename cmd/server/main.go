@@ -16,6 +16,7 @@ import (
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/gateway"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/handler"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/middleware"
+	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/session"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/store"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/worker"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/zoho"
@@ -67,13 +68,24 @@ func main() {
 	})
 
 	// --- Zoho Reply Sender ---
-	// Used by NotifyHandler to post agent replies to Zoho Cliq.
+	// Used by both the dispatcher (reply-back) and the notify handler (push).
 	var sender *zoho.Sender
 	if cfg.Zoho.CliqReplyWebhookURL != "" {
 		sender = zoho.NewSender(cfg.Zoho.CliqReplyWebhookURL)
 		slog.Info("zoho reply webhook configured")
 	} else {
 		slog.Warn("ZOHO_REPLY_WEBHOOK_URL not set — reply-back disabled")
+	}
+
+	// --- Session Reader ---
+	// Tails OpenClaw JSONL session files to extract agent replies.
+	// Replaced by POST /notify push when OpenClaw implements message:sent hook.
+	var sessionReader handler.SessionReader
+	if cfg.OpenClaw.AgentsDir != "" {
+		sessionReader = session.NewReader(cfg.OpenClaw.AgentsDir, "main")
+		slog.Info("session reader configured", "agents_dir", cfg.OpenClaw.AgentsDir)
+	} else {
+		slog.Warn("OPENCLAW_AGENTS_DIR not set — reply-back disabled")
 	}
 
 	// --- Workspace Dir ---
@@ -85,11 +97,13 @@ func main() {
 	}
 
 	// --- Worker Pool ---
-	// Dispatcher is now fire-and-forget. Replies come back via POST /notify
-	// from OpenClaw's message:sent internal hook.
+	// Dispatcher forwards jobs and returns immediately.
+	// Reply-back runs in a background goroutine per job.
 	dispatcher := handler.NewDispatcher(
 		gw,
 		refresher,
+		sender,
+		sessionReader,
 		cfg.OpenClaw.WorkspaceDir,
 	)
 
@@ -102,6 +116,8 @@ func main() {
 	// --- Handlers ---
 	webhookHandler := handler.NewWebhookHandler(pool)
 	oauthHandler := handler.NewOAuthHandler(refresher, cfg.Zoho.RedirectURI)
+	// NotifyHandler receives push from OpenClaw's message:sent hook.
+	// Wired and ready — activates automatically when OpenClaw implements the event.
 	notifyHandler := handler.NewNotifyHandler(cfg.Server.NotifySecret, sender)
 
 	// --- Router ---
@@ -111,17 +127,14 @@ func main() {
 	r.Use(chimiddleware.Recoverer)
 	r.Use(chimiddleware.Heartbeat("/healthz"))
 
-	// Inbound Zoho webhooks — HMAC token validation.
 	r.Route("/webhooks", func(r chi.Router) {
 		r.Use(middleware.ZohoHMAC(cfg.Zoho.WebhookSecret))
 		r.Post("/zoho", webhookHandler.HandleZoho)
 	})
 
-	// OAuth callback — initial token bootstrap for file downloads.
 	r.Get("/oauth/callback", oauthHandler.HandleCallback)
 
-	// OpenClaw push — receives agent replies from the message:sent hook.
-	// Not exposed publicly — called only from inside the Docker network.
+	// Push endpoint from OpenClaw hook — not exposed publicly.
 	r.Post("/notify", notifyHandler.Handle)
 
 	// --- HTTP Server ---

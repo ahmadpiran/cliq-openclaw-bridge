@@ -23,7 +23,7 @@ type ServerConfig struct {
 	WriteTimeout    time.Duration
 	IdleTimeout     time.Duration
 	ShutdownTimeout time.Duration
-	NotifySecret    string // shared secret for POST /notify from OpenClaw hook
+	NotifySecret    string
 }
 
 type ZohoConfig struct {
@@ -42,7 +42,9 @@ type OpenClawConfig struct {
 	InitialBackoff time.Duration
 	MaxBackoff     time.Duration
 	HTTPTimeout    time.Duration
+	AgentsDir      string
 	WorkspaceDir   string
+	ReplyTimeout   time.Duration
 }
 
 type StoreConfig struct {
@@ -85,7 +87,9 @@ func Load() (*Config, error) {
 		InitialBackoff: envDuration("OPENCLAW_INITIAL_BACKOFF", 500*time.Millisecond),
 		MaxBackoff:     envDuration("OPENCLAW_MAX_BACKOFF", 30*time.Second),
 		HTTPTimeout:    envDuration("OPENCLAW_HTTP_TIMEOUT", 15*time.Second),
+		AgentsDir:      envOr("OPENCLAW_AGENTS_DIR", ""),
 		WorkspaceDir:   envOr("OPENCLAW_WORKSPACE_DIR", ""),
+		ReplyTimeout:   envDuration("OPENCLAW_REPLY_TIMEOUT", 120*time.Second),
 	}
 
 	cfg.Store = StoreConfig{
@@ -95,7 +99,7 @@ func Load() (*Config, error) {
 	cfg.Worker = WorkerConfig{
 		Workers:    envInt("WORKER_COUNT", 8),
 		QueueDepth: envInt("WORKER_QUEUE_DEPTH", 512),
-		JobTimeout: envDuration("WORKER_JOB_TIMEOUT", 90*time.Second),
+		JobTimeout: envDuration("WORKER_JOB_TIMEOUT", 150*time.Second),
 	}
 
 	if len(errs) > 0 {
