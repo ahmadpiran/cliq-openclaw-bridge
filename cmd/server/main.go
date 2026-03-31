@@ -50,6 +50,8 @@ func main() {
 	slog.Info("token store opened", "path", cfg.Store.DBPath)
 
 	// --- Zoho Token Refresher ---
+	// For file attachment downloads even though reply-back
+	// now uses a webhook token instead of OAuth.
 	refresher := zoho.NewRefresher(zoho.RefresherConfig{
 		ClientID:     cfg.Zoho.ClientID,
 		ClientSecret: cfg.Zoho.ClientSecret,
@@ -66,9 +68,18 @@ func main() {
 		HTTPTimeout:    cfg.OpenClaw.HTTPTimeout,
 	})
 
-	sender := zoho.NewSender(refresher, cfg.Zoho.CliqAPIURL)
+	// --- Zoho Reply Sender ---
+	// Uses a static webhook token — no OAuth scope issues.
+	var sender *zoho.Sender
+	if cfg.Zoho.CliqReplyWebhookURL != "" {
+		sender = zoho.NewSender(cfg.Zoho.CliqReplyWebhookURL)
+		slog.Info("zoho reply webhook configured")
+	} else {
+		slog.Warn("ZOHO_REPLY_WEBHOOK_URL not set — reply-back disabled")
+	}
 
-	// Session reader — nil if no agents dir configured.
+	// --- Session Reader ---
+	// Reads OpenClaw JSONL session files to extract agent replies.
 	var sessionReader handler.SessionReader
 	if cfg.OpenClaw.AgentsDir != "" {
 		sessionReader = session.NewReader(cfg.OpenClaw.AgentsDir, "main")
@@ -77,6 +88,7 @@ func main() {
 		slog.Warn("OPENCLAW_AGENTS_DIR not set — reply-back disabled")
 	}
 
+	// --- Worker Pool ---
 	dispatcher := handler.NewDispatcher(
 		gw,
 		refresher,
@@ -85,7 +97,6 @@ func main() {
 		cfg.OpenClaw.ReplyTimeout,
 	)
 
-	// --- Worker Pool ---
 	pool := worker.New(worker.Config{
 		Workers:    cfg.Worker.Workers,
 		QueueDepth: cfg.Worker.QueueDepth,
@@ -103,13 +114,13 @@ func main() {
 	r.Use(chimiddleware.Recoverer)
 	r.Use(chimiddleware.Heartbeat("/healthz"))
 
-	// Webhook route — HMAC validation applied to this group only.
+	// Webhook route — HMAC token validation applied to this group only.
 	r.Route("/webhooks", func(r chi.Router) {
 		r.Use(middleware.ZohoHMAC(cfg.Zoho.WebhookSecret))
 		r.Post("/zoho", webhookHandler.HandleZoho)
 	})
 
-	// OAuth callback — no HMAC middleware; this receives Zoho browser redirects.
+	// OAuth callback — used only during initial token bootstrap for file downloads.
 	r.Get("/oauth/callback", oauthHandler.HandleCallback)
 
 	// --- HTTP Server ---

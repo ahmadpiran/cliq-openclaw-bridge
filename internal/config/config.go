@@ -40,12 +40,12 @@ type ServerConfig struct {
 
 // ZohoConfig holds Zoho Cliq integration credentials.
 type ZohoConfig struct {
-	WebhookSecret string
-	ClientID      string
-	ClientSecret  string
-	TokenKey      string
-	RedirectURI   string
-	CliqAPIURL    string
+	WebhookSecret       string
+	ClientID            string
+	ClientSecret        string
+	TokenKey            string
+	RedirectURI         string
+	CliqReplyWebhookURL string
 }
 
 // OpenClawConfig holds outbound gateway coordinates and retry policy.
@@ -98,12 +98,12 @@ func Load() (*Config, error) {
 
 	// --- Zoho ---
 	cfg.Zoho = ZohoConfig{
-		WebhookSecret: envRequired("ZOHO_WEBHOOK_SECRET", &errs),
-		ClientID:      envRequired("ZOHO_CLIENT_ID", &errs),
-		ClientSecret:  envRequired("ZOHO_CLIENT_SECRET", &errs),
-		TokenKey:      envOr("ZOHO_TOKEN_KEY", "zoho:default"),
-		RedirectURI:   envOr("ZOHO_REDIRECT_URI", ""),
-		CliqAPIURL:    envOr("ZOHO_CLIQ_API_URL", "https://cliq.zoho.com"),
+		WebhookSecret:       envRequired("ZOHO_WEBHOOK_SECRET", &errs),
+		ClientID:            envRequired("ZOHO_CLIENT_ID", &errs),
+		ClientSecret:        envRequired("ZOHO_CLIENT_SECRET", &errs),
+		TokenKey:            envOr("ZOHO_TOKEN_KEY", "zoho:default"),
+		RedirectURI:         envOr("ZOHO_REDIRECT_URI", ""),
+		CliqReplyWebhookURL: envOr("ZOHO_REPLY_WEBHOOK_URL", ""),
 	}
 
 	// --- OpenClaw ---

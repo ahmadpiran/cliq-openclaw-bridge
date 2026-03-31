@@ -13,20 +13,19 @@ import (
 
 const senderTimeout = 10 * time.Second
 
-// Sender posts messages to Zoho Cliq channels using the REST API.
+// Sender posts messages back to Zoho Cliq via an incoming webhook URL.
+// No OAuth token needed — the webhook URL is self-authenticating.
 type Sender struct {
-	refresher *Refresher
-	http      *http.Client
-	baseURL   string
+	webhookURL string
+	http       *http.Client
 }
 
 // NewSender constructs a Sender.
-// baseURL is the Zoho Cliq API root, e.g. "https://cliq.zoho.com".
-func NewSender(refresher *Refresher, baseURL string) *Sender {
+// webhookURL is the Zoho Cliq incoming webhook URL configured for the bot.
+func NewSender(webhookURL string) *Sender {
 	return &Sender{
-		refresher: refresher,
-		http:      &http.Client{Timeout: senderTimeout},
-		baseURL:   baseURL,
+		webhookURL: webhookURL,
+		http:       &http.Client{Timeout: senderTimeout},
 	}
 }
 
@@ -34,43 +33,32 @@ type cliqMessagePayload struct {
 	Text string `json:"text"`
 }
 
-// PostToChannel posts a text message back to a Zoho Cliq chat by its ID.
-// Works for both bot DMs (chat_type=bot) and channel chats (chat_type=channel).
-func (s *Sender) PostToChannel(ctx context.Context, chatID, text string) error {
-	token, err := s.refresher.ValidToken(ctx)
-	if err != nil {
-		return fmt.Errorf("get zoho token for reply: %w", err)
-	}
-
+// PostToChannel posts a reply to Zoho Cliq via the incoming webhook.
+// The chatID parameter is accepted for interface compatibility but not used —
+// the webhook URL already encodes the destination.
+func (s *Sender) PostToChannel(ctx context.Context, _ string, text string) error {
 	body, err := json.Marshal(cliqMessagePayload{Text: text})
 	if err != nil {
 		return fmt.Errorf("marshal cliq message: %w", err)
 	}
 
-	// /api/v2/chats/{chat_id}/message works for all chat types.
-	url := fmt.Sprintf("%s/api/v2/chats/%s/message", s.baseURL, chatID)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.webhookURL, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("build cliq message request: %w", err)
+		return fmt.Errorf("build cliq webhook request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Zoho-oauthtoken "+token)
 
 	resp, err := s.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("post cliq message: %w", err)
+		return fmt.Errorf("post cliq webhook: %w", err)
 	}
 	defer resp.Body.Close()
 
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("cliq message status %d: %s", resp.StatusCode, string(raw))
+		return fmt.Errorf("cliq webhook status %d: %s", resp.StatusCode, string(raw))
 	}
 
-	slog.Info("zoho cliq reply sent",
-		"chat_id", chatID,
-		"status", resp.StatusCode,
-	)
+	slog.Info("zoho cliq reply sent via webhook", "status", resp.StatusCode)
 	return nil
 }
