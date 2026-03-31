@@ -150,6 +150,14 @@ func (d *Dispatcher) forward(ctx context.Context, job worker.Job, p zohoMessageP
 		"reply_len", len(reply),
 	)
 
+	// OpenClaw returns "NO_REPLY" when it has nothing to say (e.g. file-only message).
+	// Do not post this literal string back to the user.
+	if reply == "NO_REPLY" || reply == "" {
+		slog.Info("dispatcher: agent returned no reply, skipping post",
+			"request_id", job.RequestID)
+		return nil
+	}
+
 	if err := d.sender.PostToChannel(ctx, p.Message.Channel, reply); err != nil {
 		slog.Error("dispatcher: failed to post reply",
 			"request_id", job.RequestID, "error", err)
