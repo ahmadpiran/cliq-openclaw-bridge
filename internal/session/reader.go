@@ -130,3 +130,43 @@ func lastAssistantMessage(path string, afterTime time.Time) (string, error) {
 
 	return result, scanner.Err()
 }
+
+func (r *Reader) TailAssistantMessages(
+	ctx context.Context,
+	sessionFile string,
+	afterTime time.Time,
+	idleTimeout time.Duration,
+	out chan<- string,
+) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	idleTimer := time.NewTimer(idleTimeout)
+	defer idleTimer.Stop()
+
+	lastSeen := afterTime
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-idleTimer.C:
+			return
+		case <-ticker.C:
+			text, err := lastAssistantMessage(sessionFile, lastSeen)
+			if err != nil || text == "" {
+				continue
+			}
+			// New message found — reset idle timer and advance the cursor.
+			if !idleTimer.Stop() {
+				select {
+				case <-idleTimer.C:
+				default:
+				}
+			}
+			idleTimer.Reset(idleTimeout)
+			lastSeen = time.Now()
+			out <- text
+		}
+	}
+}

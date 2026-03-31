@@ -71,6 +71,21 @@ func (f *fakeSessionReader) WaitForAssistantReply(_ context.Context, _ string, _
 	return f.reply, f.replyErr
 }
 
+func (f *fakeSessionReader) TailAssistantMessages(
+	ctx context.Context, _ string, _ time.Time, _ time.Duration, out chan<- string,
+) {
+	f.calls.Add(1)
+	if f.replyErr != nil {
+		return
+	}
+	if f.reply != "" {
+		select {
+		case out <- f.reply:
+		case <-ctx.Done():
+		}
+	}
+}
+
 // --- helpers ---
 
 func newDispatcher(

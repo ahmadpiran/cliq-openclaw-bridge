@@ -2,6 +2,7 @@ package session_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -85,5 +86,60 @@ func TestFindLatestSessionFile(t *testing.T) {
 	}
 	if got != newFile {
 		t.Errorf("expected %s, got %s", newFile, got)
+	}
+}
+
+func TestTailAssistantMessages_ReceivesMultipleReplies(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tail.jsonl")
+
+	writeAssistant := func(text string) {
+		f, _ := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		entry := fmt.Sprintf(`{"type":"message","timestamp":%q,"message":{"role":"assistant","content":[{"type":"text","text":%q}]}}`,
+			time.Now().UTC().Format(time.RFC3339Nano), text)
+		f.WriteString(entry + "\n")
+		f.Close()
+	}
+
+	writeAssistant("first reply")
+
+	r := session.NewReader(dir, ".")
+	out := make(chan string, 4)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	afterTime := time.Now().Add(-1 * time.Second)
+
+	go r.TailAssistantMessages(ctx, path, afterTime, 800*time.Millisecond, out)
+
+	// Wait longer than one tick interval (500ms) so the first tick fires and
+	// picks up "first reply" before "second reply" is written.
+	// If both exist at the same tick, lastAssistantMessage returns only the last.
+	time.Sleep(700 * time.Millisecond)
+	writeAssistant("second reply after approval")
+
+	var received []string
+	timeout := time.After(4 * time.Second)
+	for {
+		select {
+		case msg := <-out:
+			received = append(received, msg)
+			if len(received) == 2 {
+				goto done
+			}
+		case <-timeout:
+			goto done
+		}
+	}
+done:
+	if len(received) != 2 {
+		t.Fatalf("expected 2 messages, got %d: %v", len(received), received)
+	}
+	if received[0] != "first reply" {
+		t.Errorf("first message wrong: %s", received[0])
+	}
+	if received[1] != "second reply after approval" {
+		t.Errorf("second message wrong: %s", received[1])
 	}
 }

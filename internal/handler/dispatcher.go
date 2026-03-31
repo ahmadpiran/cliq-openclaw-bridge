@@ -31,6 +31,7 @@ type ZohoSender interface {
 type SessionReader interface {
 	FindLatestSessionFile(afterTime time.Time) (string, error)
 	WaitForAssistantReply(ctx context.Context, sessionFile string, afterTime time.Time) (string, error)
+	TailAssistantMessages(ctx context.Context, sessionFile string, afterTime time.Time, idleTimeout time.Duration, out chan<- string)
 }
 
 // zohoMessagePayload is the structure the Deluge script sends to the bridge.
@@ -165,8 +166,9 @@ func (d *Dispatcher) handleFile(ctx context.Context, job worker.Job, msg struct 
 	return d.postReply(ctx, job, msg.Channel, dispatchTime)
 }
 
-// postReply waits for the agent reply and posts it back to Zoho Cliq.
-// Errors here are soft — the job itself is considered successful.
+// postReply tails the session file and posts every new assistant message to
+// Zoho Cliq until the agent goes idle. This handles multi-turn flows like
+// tool approvals where the final reply comes after user interaction.
 func (d *Dispatcher) postReply(ctx context.Context, job worker.Job, channel string, afterTime time.Time) error {
 	if d.sender == nil || d.sessionReader == nil || channel == "" {
 		slog.Info("dispatcher: reply-back skipped",
@@ -184,37 +186,44 @@ func (d *Dispatcher) postReply(ctx context.Context, job worker.Job, channel stri
 		return nil
 	}
 
-	slog.Info("dispatcher: found session file",
+	slog.Info("dispatcher: found session file, tailing for replies",
 		"request_id", job.RequestID, "file", sessionFile)
 
 	replyCtx, cancel := context.WithTimeout(ctx, d.replyTimeout)
 	defer cancel()
 
-	reply, err := d.sessionReader.WaitForAssistantReply(replyCtx, sessionFile, afterTime)
-	if err != nil {
-		slog.Error("dispatcher: timeout waiting for agent reply",
-			"request_id", job.RequestID, "error", err)
-		return nil
+	out := make(chan string, 8)
+
+	// idleTimeout: stop watching after this long with no new agent message.
+	// Short enough to feel responsive, long enough for tool execution.
+	const idleTimeout = 15 * time.Second
+
+	go d.sessionReader.TailAssistantMessages(replyCtx, sessionFile, afterTime, idleTimeout, out)
+
+	for {
+		select {
+		case reply, ok := <-out:
+			if !ok {
+				return nil
+			}
+			if reply == "" || reply == "NO_REPLY" {
+				continue
+			}
+			slog.Info("dispatcher: agent replied, posting to zoho cliq",
+				"request_id", job.RequestID,
+				"channel", channel,
+				"reply_len", len(reply),
+			)
+			if err := d.sender.PostToChannel(ctx, channel, reply); err != nil {
+				slog.Error("dispatcher: failed to post reply",
+					"request_id", job.RequestID, "error", err)
+			}
+		case <-replyCtx.Done():
+			slog.Info("dispatcher: reply timeout reached",
+				"request_id", job.RequestID)
+			return nil
+		}
 	}
-
-	if reply == "" || reply == "NO_REPLY" {
-		slog.Info("dispatcher: agent returned no reply, skipping post",
-			"request_id", job.RequestID)
-		return nil
-	}
-
-	slog.Info("dispatcher: agent replied, posting to zoho cliq",
-		"request_id", job.RequestID,
-		"channel", channel,
-		"reply_len", len(reply),
-	)
-
-	if err := d.sender.PostToChannel(ctx, channel, reply); err != nil {
-		slog.Error("dispatcher: failed to post reply",
-			"request_id", job.RequestID, "error", err)
-	}
-
-	return nil
 }
 
 // forwardRaw forwards an unrecognised payload without reply-back.
