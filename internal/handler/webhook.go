@@ -48,6 +48,7 @@ func (h *WebhookHandler) HandleZoho(w http.ResponseWriter, r *http.Request) {
 	// Read the body. The HMAC middleware already capped this at 2 MiB and
 	// restored it, so this read is safe and bounded.
 	body, err := io.ReadAll(r.Body)
+	slog.Debug("raw payload", "body", string(body))
 	if err != nil {
 		slog.Error("webhook handler: failed to read body",
 			"request_id", requestID,
