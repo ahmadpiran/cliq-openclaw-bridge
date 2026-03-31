@@ -24,7 +24,6 @@ bootstrap-oauth:
 	echo "" && \
 	echo "Open this URL in your browser and authorise the app:" && \
 	echo "" && \
-	echo "  https://accounts.zoho.com/oauth/v2/auth?scope=ZohoCliq.Channels.UPDATE&client_id=$$ZOHO_CLIENT_ID&response_type=code&redirect_uri=$$ZOHO_REDIRECT_URI&access_type=offline" && \
+	echo "  https://accounts.zoho.com/oauth/v2/auth?scope=ZohoCliq.Chats.UPDATE&client_id=$$ZOHO_CLIENT_ID&response_type=code&redirect_uri=$$ZOHO_REDIRECT_URI&access_type=offline" && \
 	echo "" && \
-	echo "After authorising, Zoho will redirect to your ZOHO_REDIRECT_URI with ?code=<value>." && \
-	echo "The running service handles the exchange at GET /oauth/callback."
+	echo "After authorising, Zoho redirects to ZOHO_REDIRECT_URI with ?code=<value>."

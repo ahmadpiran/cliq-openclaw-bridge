@@ -34,8 +34,9 @@ type cliqMessagePayload struct {
 	Text string `json:"text"`
 }
 
-// PostToChannel posts a text message to a Zoho Cliq channel by its unique name.
-func (s *Sender) PostToChannel(ctx context.Context, channelName, text string) error {
+// PostToChannel posts a text message back to a Zoho Cliq chat by its ID.
+// Works for both bot DMs (chat_type=bot) and channel chats (chat_type=channel).
+func (s *Sender) PostToChannel(ctx context.Context, chatID, text string) error {
 	token, err := s.refresher.ValidToken(ctx)
 	if err != nil {
 		return fmt.Errorf("get zoho token for reply: %w", err)
@@ -46,7 +47,8 @@ func (s *Sender) PostToChannel(ctx context.Context, channelName, text string) er
 		return fmt.Errorf("marshal cliq message: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/api/v2/channelsbyname/%s/message", s.baseURL, channelName)
+	// /api/v2/chats/{chat_id}/message works for all chat types.
+	url := fmt.Sprintf("%s/api/v2/chats/%s/message", s.baseURL, chatID)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -67,7 +69,7 @@ func (s *Sender) PostToChannel(ctx context.Context, channelName, text string) er
 	}
 
 	slog.Info("zoho cliq reply sent",
-		"channel", channelName,
+		"chat_id", chatID,
 		"status", resp.StatusCode,
 	)
 	return nil
