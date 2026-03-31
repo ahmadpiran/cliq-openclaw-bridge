@@ -37,16 +37,15 @@ type ZohoSender interface {
 type zohoMessagePayload struct {
 	Type    string `json:"type"`
 	Message struct {
-		Text         string `json:"text"`
-		Sender       string `json:"sender"`
-		Channel      string `json:"channel"`       // unique name — used for reply API call
-		ChannelTitle string `json:"channel_title"` // display title — for logs
+		Text           string `json:"text"`
+		Sender         string `json:"sender"`
+		Channel        string `json:"channel"`
+		ChannelTitle   string `json:"channel_title"`
+		MessageType    string `json:"message_type"`   // "text" or "file"
+		AttachmentURL  string `json:"attachment_url"` // short-lived Zoho download URL
+		AttachmentName string `json:"attachment_name"`
+		AttachmentMime string `json:"attachment_mime"`
 	} `json:"message"`
-	Attachment *struct {
-		DownloadURL string `json:"download_url"`
-		Name        string `json:"name"`
-		MimeType    string `json:"mime_type"`
-	} `json:"attachment,omitempty"`
 }
 
 // Dispatcher routes jobs from the worker pool.
@@ -85,8 +84,9 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job worker.Job) error {
 		return d.forwardRaw(ctx, job)
 	}
 
-	if p.Attachment != nil && p.Attachment.DownloadURL != "" {
-		return d.streamAttachment(ctx, job, p.Attachment)
+	// File attachment — stream directly to OpenClaw workspace
+	if p.Message.MessageType == "file" && p.Message.AttachmentURL != "" {
+		return d.streamAttachment(ctx, job, p.Message)
 	}
 
 	return d.forward(ctx, job, p)
@@ -195,20 +195,26 @@ func (d *Dispatcher) forwardRaw(ctx context.Context, job worker.Job) error {
 	})
 }
 
-func (d *Dispatcher) streamAttachment(
-	ctx context.Context,
-	job worker.Job,
-	att *struct {
-		DownloadURL string `json:"download_url"`
-		Name        string `json:"name"`
-		MimeType    string `json:"mime_type"`
-	},
-) error {
+func (d *Dispatcher) streamAttachment(ctx context.Context, job worker.Job, msg struct {
+	Text           string `json:"text"`
+	Sender         string `json:"sender"`
+	Channel        string `json:"channel"`
+	ChannelTitle   string `json:"channel_title"`
+	MessageType    string `json:"message_type"`
+	AttachmentURL  string `json:"attachment_url"`
+	AttachmentName string `json:"attachment_name"`
+	AttachmentMime string `json:"attachment_mime"`
+}) error {
 	token, err := d.refresher.ValidToken(ctx)
 	if err != nil {
 		return fmt.Errorf("get zoho token for file download: %w", err)
 	}
+
 	slog.Info("dispatcher: streaming file attachment",
-		"request_id", job.RequestID, "filename", att.Name)
-	return d.gw.StreamFile(ctx, att.DownloadURL, att.Name, att.MimeType, token)
+		"request_id", job.RequestID,
+		"filename", msg.AttachmentName,
+		"mime_type", msg.AttachmentMime,
+	)
+
+	return d.gw.StreamFile(ctx, msg.AttachmentURL, msg.AttachmentName, msg.AttachmentMime, token)
 }
