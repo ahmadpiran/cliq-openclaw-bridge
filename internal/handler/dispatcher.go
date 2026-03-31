@@ -123,21 +123,19 @@ func (d *Dispatcher) forward(ctx context.Context, job worker.Job, p zohoMessageP
 		return nil
 	}
 
-	// Give OpenClaw a moment to start writing before we scan for the file.
-	time.Sleep(1 * time.Second)
+	replyCtx, cancel := context.WithTimeout(ctx, d.replyTimeout)
+	defer cancel()
 
-	sessionFile, err := d.sessionReader.FindLatestSessionFile(dispatchTime)
+	// Poll for the session file — OpenClaw may take several seconds to create it.
+	sessionFile, err := d.waitForSessionFile(replyCtx, dispatchTime)
 	if err != nil {
-		slog.Error("dispatcher: session file not found",
+		slog.Error("dispatcher: session file never appeared",
 			"request_id", job.RequestID, "error", err)
 		return nil
 	}
 
 	slog.Info("dispatcher: found session file",
 		"request_id", job.RequestID, "file", sessionFile)
-
-	replyCtx, cancel := context.WithTimeout(ctx, d.replyTimeout)
-	defer cancel()
 
 	reply, err := d.sessionReader.WaitForAssistantReply(replyCtx, sessionFile, dispatchTime)
 	if err != nil {
@@ -158,6 +156,25 @@ func (d *Dispatcher) forward(ctx context.Context, job worker.Job, p zohoMessageP
 	}
 
 	return nil
+}
+
+// waitForSessionFile polls FindLatestSessionFile every second until a session
+// file modified after afterTime appears or the context expires.
+func (d *Dispatcher) waitForSessionFile(ctx context.Context, afterTime time.Time) (string, error) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("timed out waiting for session file: %w", ctx.Err())
+		case <-ticker.C:
+			f, err := d.sessionReader.FindLatestSessionFile(afterTime)
+			if err == nil {
+				return f, nil
+			}
+		}
+	}
 }
 
 func (d *Dispatcher) forwardRaw(ctx context.Context, job worker.Job) error {
