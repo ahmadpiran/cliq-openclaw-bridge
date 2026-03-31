@@ -117,7 +117,7 @@ func (d *Dispatcher) forward(ctx context.Context, job worker.Job, p zohoMessageP
 	slog.Info("dispatcher: job forwarded to openclaw",
 		"request_id", job.RequestID)
 
-	return d.postReply(ctx, job, p.Message.Channel, dispatchTime)
+	return d.postReply(ctx, job, p.Message.Channel, dispatchTime, false)
 }
 
 // handleFile downloads the file to the OpenClaw workspace and asks the agent to process it.
@@ -163,13 +163,13 @@ func (d *Dispatcher) handleFile(ctx context.Context, job worker.Job, msg struct 
 		return fmt.Errorf("download and forward: %w", err)
 	}
 
-	return d.postReply(ctx, job, msg.Channel, dispatchTime)
+	return d.postReply(ctx, job, msg.Channel, dispatchTime, true)
 }
 
 // postReply tails the session file and posts every new assistant message to
 // Zoho Cliq until the agent goes idle. This handles multi-turn flows like
 // tool approvals where the final reply comes after user interaction.
-func (d *Dispatcher) postReply(ctx context.Context, job worker.Job, channel string, afterTime time.Time) error {
+func (d *Dispatcher) postReply(ctx context.Context, job worker.Job, channel string, afterTime time.Time, isFile bool) error {
 	if d.sender == nil || d.sessionReader == nil || channel == "" {
 		slog.Info("dispatcher: reply-back skipped",
 			"has_sender", d.sender != nil,
@@ -194,9 +194,11 @@ func (d *Dispatcher) postReply(ctx context.Context, job worker.Job, channel stri
 
 	out := make(chan string, 8)
 
-	// idleTimeout: stop watching after this long with no new agent message.
-	// Short enough to feel responsive, long enough for tool execution.
-	const idleTimeout = 15 * time.Second
+	// Give large file processing more idle time — PDF extraction can take 30s+.
+	idleTimeout := 15 * time.Second
+	if isFile {
+		idleTimeout = 60 * time.Second
+	}
 
 	go d.sessionReader.TailAssistantMessages(replyCtx, sessionFile, afterTime, idleTimeout, out)
 
