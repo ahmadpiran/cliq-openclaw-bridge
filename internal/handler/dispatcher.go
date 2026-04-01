@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/gateway"
@@ -44,15 +45,16 @@ type zohoMessagePayload struct {
 }
 
 // Dispatcher routes jobs from the worker pool to the correct processing path.
-// Reply-back runs in its own goroutine with an independent context so that
-// the worker job context expiring does not kill the reply watcher.
+// claimedSessions prevents two reply goroutines from tailing the same session
+// file simultaneously, which would cause duplicate messages in Zoho Cliq.
 type Dispatcher struct {
-	gw            Forwarder
-	refresher     TokenProvider
-	sender        ZohoSender
-	sessionReader SessionReader
-	workspaceDir  string
-	replyTimeout  time.Duration
+	gw              Forwarder
+	refresher       TokenProvider
+	sender          ZohoSender
+	sessionReader   SessionReader
+	workspaceDir    string
+	replyTimeout    time.Duration
+	claimedSessions sync.Map // map[string]struct{} — session file path → claimed
 }
 
 func NewDispatcher(
@@ -110,8 +112,6 @@ func (d *Dispatcher) forward(ctx context.Context, job worker.Job, p zohoMessageP
 	slog.Info("dispatcher: job forwarded to openclaw",
 		"request_id", job.RequestID)
 
-	// postReply gets its own context — independent of the worker job context
-	// which is cancelled as soon as Dispatch returns.
 	go d.postReply(job.RequestID, p.Message.Channel, dispatchTime)
 
 	return nil
@@ -168,8 +168,8 @@ func (d *Dispatcher) handleFile(ctx context.Context, job worker.Job, msg struct 
 }
 
 // postReply runs in a goroutine with its own context derived from Background.
-// This is critical — the worker job context is cancelled when Dispatch returns,
-// so we must not use it here.
+// It polls for an unclaimed session file, claims it exclusively, tails it for
+// replies, then releases the claim when done.
 func (d *Dispatcher) postReply(requestID, channel string, afterTime time.Time) {
 	if d.sender == nil || d.sessionReader == nil || channel == "" {
 		slog.Info("dispatcher: reply-back skipped",
@@ -180,24 +180,45 @@ func (d *Dispatcher) postReply(requestID, channel string, afterTime time.Time) {
 		return
 	}
 
-	// Independent context — lives for replyTimeout regardless of job lifecycle.
 	ctx, cancel := context.WithTimeout(context.Background(), d.replyTimeout)
 	defer cancel()
 
-	// Poll until session file appears.
 	fileTicker := time.NewTicker(1 * time.Second)
 	defer fileTicker.Stop()
 
+	// tryClaimFile attempts to find a session file created after afterTime and
+	// claim it exclusively. Returns the path on success, empty string otherwise.
+	tryClaimFile := func() string {
+		f, err := d.sessionReader.FindLatestSessionFile(afterTime)
+		if err != nil {
+			return ""
+		}
+		if _, alreadyClaimed := d.claimedSessions.LoadOrStore(f, struct{}{}); alreadyClaimed {
+			slog.Debug("dispatcher: session file already claimed, waiting for new one",
+				"request_id", requestID, "file", f)
+			return ""
+		}
+		return f
+	}
+
 	var sessionFile string
+
+	// Try immediately before waiting for the first tick. This keeps the
+	// reply-back goroutine fast in tests and in production when the agent
+	// responds quickly (within the first polling window).
+	if f := tryClaimFile(); f != "" {
+		sessionFile = f
+		goto found
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Warn("dispatcher: timed out waiting for session file",
+			slog.Warn("dispatcher: timed out waiting for unclaimed session file",
 				"request_id", requestID)
 			return
 		case <-fileTicker.C:
-			f, err := d.sessionReader.FindLatestSessionFile(afterTime)
-			if err == nil {
+			if f := tryClaimFile(); f != "" {
 				sessionFile = f
 				goto found
 			}
@@ -205,6 +226,8 @@ func (d *Dispatcher) postReply(requestID, channel string, afterTime time.Time) {
 	}
 
 found:
+	defer d.claimedSessions.Delete(sessionFile)
+
 	slog.Info("dispatcher: found session file, tailing for replies",
 		"request_id", requestID, "file", sessionFile)
 

@@ -79,6 +79,37 @@ func (f *fakeSessionReader) TailAssistantMessages(
 	}
 }
 
+// blockingSessionReader returns the same file but blocks until released,
+// used to hold a claim open while testing the exclusion behaviour.
+type blockingSessionReader struct {
+	file    string
+	fileErr error
+	reply   string
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+func (b *blockingSessionReader) FindLatestSessionFile(_ time.Time) (string, error) {
+	return b.file, b.fileErr
+}
+
+func (b *blockingSessionReader) TailAssistantMessages(
+	ctx context.Context, _ string, _ time.Time, out chan<- string,
+) {
+	b.calls.Add(1)
+	// Block until released or context done, then optionally send a reply.
+	select {
+	case <-b.release:
+		if b.reply != "" {
+			select {
+			case out <- b.reply:
+			case <-ctx.Done():
+			}
+		}
+	case <-ctx.Done():
+	}
+}
+
 // --- helpers ---
 
 func newDispatcher(
@@ -206,7 +237,6 @@ func TestDispatcher_PostsReplyToZohoCliqAfterAgentResponds(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Give the goroutine time to post the reply.
 	time.Sleep(300 * time.Millisecond)
 
 	if gw.forwarded.Load() != 1 {
@@ -220,6 +250,49 @@ func TestDispatcher_PostsReplyToZohoCliqAfterAgentResponds(t *testing.T) {
 	}
 	if sender.lastText != "Hey Ross! 👋" {
 		t.Errorf("wrong reply text: %s", sender.lastText)
+	}
+}
+
+func TestDispatcher_NoDuplicatesWhenTwoJobsRaceForSameSessionFile(t *testing.T) {
+	gw := &fakeForwarder{}
+	sender := &fakeZohoSender{}
+	release := make(chan struct{})
+	reader := &blockingSessionReader{
+		file:    "shared.jsonl",
+		reply:   "single reply",
+		release: release,
+	}
+
+	d := handler.NewDispatcher(gw, &fakeTokenProvider{}, sender, reader, "", 3*time.Second)
+
+	jobA := makeJob(t, map[string]any{
+		"type": "message",
+		"message": map[string]any{
+			"text": "first", "sender": "Ross",
+			"channel": "CT_123", "message_type": "text",
+		},
+	})
+	jobB := makeJob(t, map[string]any{
+		"type": "message",
+		"message": map[string]any{
+			"text": "second", "sender": "Ross",
+			"channel": "CT_123", "message_type": "text",
+		},
+	})
+
+	_ = d.Dispatch(context.Background(), jobA)
+	// Give goroutine A time to run its immediate tryClaimFile and register the claim.
+	time.Sleep(100 * time.Millisecond)
+	_ = d.Dispatch(context.Background(), jobB)
+	// Give goroutine B time to attempt and fail to claim the file.
+	time.Sleep(100 * time.Millisecond)
+
+	// Release goroutine A — it sends its reply and releases the claim.
+	close(release)
+	time.Sleep(300 * time.Millisecond)
+
+	if n := sender.sent.Load(); n != 1 {
+		t.Errorf("expected exactly 1 reply sent, got %d (duplicate suppression failed)", n)
 	}
 }
 
