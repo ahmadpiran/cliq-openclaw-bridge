@@ -45,10 +45,7 @@ func NewWebhookHandler(pool *worker.Pool) *WebhookHandler {
 func (h *WebhookHandler) HandleZoho(w http.ResponseWriter, r *http.Request) {
 	requestID := middleware.GetReqID(r.Context())
 
-	// Read the body. The HMAC middleware already capped this at 2 MiB and
-	// restored it, so this read is safe and bounded.
 	body, err := io.ReadAll(r.Body)
-	slog.Debug("raw payload", "body", string(body))
 	if err != nil {
 		slog.Error("webhook handler: failed to read body",
 			"request_id", requestID,
@@ -58,11 +55,15 @@ func (h *WebhookHandler) HandleZoho(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Partial decode for logging and future routing — does not block dispatch.
+	// Zoho Cliq sends automatic link-preview webhooks when a message contains
+	// a URL. These payloads contain raw newlines inside JSON string values,
+	// making them invalid JSON. Sanitize before attempting to decode.
+	sanitized := sanitizeJSON(body)
+
+	slog.Debug("raw payload", "body", string(sanitized))
+
 	var payload ZohoPayload
-	if err := json.Unmarshal(body, &payload); err != nil {
-		// A non-fatal warning: we still forward malformed payloads to the worker
-		// so nothing is silently dropped. The worker can decide what to do.
+	if err := json.Unmarshal(sanitized, &payload); err != nil {
 		slog.Warn("webhook handler: could not decode payload for logging",
 			"request_id", requestID,
 			"error", err,
@@ -78,13 +79,11 @@ func (h *WebhookHandler) HandleZoho(w http.ResponseWriter, r *http.Request) {
 
 	job := worker.Job{
 		RequestID:  requestID,
-		Payload:    body,
+		Payload:    sanitized,
 		ReceivedAt: time.Now(),
 	}
 
 	if err := h.pool.Dispatch(job); err != nil {
-		// ErrQueueFull or ErrPoolClosed. We return 429 so Zoho can retry later
-		// rather than 500 which Zoho may treat as a permanent failure.
 		slog.Warn("webhook handler: dispatch failed",
 			"request_id", requestID,
 			"error", err,
@@ -93,6 +92,47 @@ func (h *WebhookHandler) HandleZoho(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Respond immediately — Zoho only needs acknowledgement of receipt.
 	w.WriteHeader(http.StatusOK)
+}
+
+// sanitizeJSON replaces raw control characters inside JSON string values
+// that Zoho Cliq embeds in link-preview webhook payloads.
+func sanitizeJSON(data []byte) []byte {
+	result := make([]byte, 0, len(data))
+	inString := false
+	escaped := false
+
+	for i := 0; i < len(data); i++ {
+		b := data[i]
+		if escaped {
+			result = append(result, b)
+			escaped = false
+			continue
+		}
+		if b == '\\' && inString {
+			result = append(result, b)
+			escaped = true
+			continue
+		}
+		if b == '"' {
+			inString = !inString
+			result = append(result, b)
+			continue
+		}
+		if inString {
+			switch b {
+			case '\n':
+				result = append(result, '\\', 'n')
+			case '\r':
+				result = append(result, '\\', 'r')
+			case '\t':
+				result = append(result, '\\', 't')
+			default:
+				result = append(result, b)
+			}
+			continue
+		}
+		result = append(result, b)
+	}
+	return result
 }
