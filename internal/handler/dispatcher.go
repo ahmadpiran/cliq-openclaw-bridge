@@ -92,7 +92,7 @@ func sessionKeyForChannel(channelID string) string {
 	if channelID == "" {
 		return "hook:zoho-cliq"
 	}
-	return "zoho-cliq:" + channelID
+	return "hook:zoho-cliq:" + channelID
 }
 
 type Dispatcher struct {
