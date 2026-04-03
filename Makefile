@@ -18,15 +18,12 @@ docker-run:
 	docker compose up --build
 
 # ── OAuth bootstrap ────────────────────────────────────────────────────────────
-# Scopes:
-#   ZohoCliq.Files.READ   — download files sent by users in Zoho Cliq
-#   ZohoCliq.Files.UPDATE — upload files from the agent back to Zoho Cliq
 bootstrap-oauth:
 	@export $$(cat .env | xargs) && \
 	echo "" && \
 	echo "Open this URL in your browser and authorise the app:" && \
 	echo "" && \
-	echo "  https://accounts.zoho.com/oauth/v2/auth?scope=ZohoCliq.Files.READ,ZohoCliq.Files.UPDATE&client_id=$$ZOHO_CLIENT_ID&response_type=code&redirect_uri=$$ZOHO_REDIRECT_URI&access_type=offline&prompt=consent" && \
+	echo "  https://accounts.zoho.com/oauth/v2/auth?scope=ZohoCliq.Chats.UPDATE&client_id=$$ZOHO_CLIENT_ID&response_type=code&redirect_uri=$$ZOHO_REDIRECT_URI&access_type=offline&prompt=consent" && \
 	echo "" && \
 	echo "After authorising, Zoho redirects to ZOHO_REDIRECT_URI with ?code=<value>." && \
 	echo "The bridge /oauth/callback endpoint handles the rest automatically."
