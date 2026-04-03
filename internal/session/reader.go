@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -32,9 +33,15 @@ func NewReader(agentsDir, agentID string) *Reader {
 	return &Reader{agentsDir: agentsDir, agentID: agentID}
 }
 
-// FindLatestSessionFile returns the JSONL file most recently modified
-// at or after afterTime.
-func (r *Reader) FindLatestSessionFile(afterTime time.Time) (string, error) {
+// FindLatestSessionFile returns the JSONL session file for the given session key.
+//
+// Strategy:
+//  1. If sessionKey is non-empty, look for a file whose base name contains the
+//     sanitised key — OpenClaw typically names session files after the session
+//     key. This prevents tailing the wrong channel's file under concurrent load.
+//  2. Fall back to the most recently modified file after afterTime (original
+//     behaviour) in case OpenClaw uses opaque or timestamped filenames.
+func (r *Reader) FindLatestSessionFile(afterTime time.Time, sessionKey string) (string, error) {
 	pattern := filepath.Join(r.agentsDir, r.agentID, "sessions", "*.jsonl")
 	files, err := filepath.Glob(pattern)
 	if err != nil {
@@ -44,6 +51,26 @@ func (r *Reader) FindLatestSessionFile(afterTime time.Time) (string, error) {
 		return "", fmt.Errorf("no session files found in %s", pattern)
 	}
 
+	// Pass 1: prefer a file whose name contains the sanitised session key.
+	// Only consider files modified at or after afterTime so we don't claim a
+	// stale file from a previous conversation.
+	if sessionKey != "" {
+		safeKey := sanitiseSessionKey(sessionKey)
+		for _, f := range files {
+			if !strings.Contains(filepath.Base(f), safeKey) {
+				continue
+			}
+			info, err := os.Stat(f)
+			if err != nil {
+				continue
+			}
+			if !info.ModTime().Before(afterTime) {
+				return f, nil
+			}
+		}
+	}
+
+	// Pass 2: newest file by modification time — original fallback.
 	var best string
 	var bestMod time.Time
 
@@ -67,6 +94,13 @@ func (r *Reader) FindLatestSessionFile(afterTime time.Time) (string, error) {
 	}
 
 	return best, nil
+}
+
+// sanitiseSessionKey replaces characters that are invalid or awkward in file
+// names so the key can be matched against session file base names.
+// e.g. "zoho-cliq:CT_abc123" → "zoho-cliq_CT_abc123"
+func sanitiseSessionKey(key string) string {
+	return strings.NewReplacer(":", "_", "/", "_", "\\", "_").Replace(key)
 }
 
 // TailAssistantMessages watches sessionFile and sends each new assistant

@@ -26,7 +26,7 @@ func TestFindLatestSessionFile(t *testing.T) {
 	os.WriteFile(newFile, []byte(`{"type":"message"}`+"\n"), 0644)
 
 	r := session.NewReader(dir, "main")
-	got, err := r.FindLatestSessionFile(before)
+	got, err := r.FindLatestSessionFile(before, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

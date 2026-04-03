@@ -29,7 +29,7 @@ type ZohoSender interface {
 }
 
 type SessionReader interface {
-	FindLatestSessionFile(afterTime time.Time) (string, error)
+	FindLatestSessionFile(afterTime time.Time, sessionKey string) (string, error)
 	TailAssistantMessages(ctx context.Context, sessionFile string, afterTime time.Time, out chan<- string)
 }
 
@@ -56,7 +56,6 @@ type parsedReply struct {
 // parseReply extracts [FILE:path] tags from a reply.
 // The agent writes ~/workspace/... paths; we resolve them against workspaceDir.
 // Text with the tag stripped is returned alongside the resolved file path.
-
 func parseReply(reply, workspaceDir string) parsedReply {
 	const prefix = "[FILE:"
 	const suffix = "]"
@@ -82,6 +81,18 @@ func parseReply(reply, workspaceDir string) parsedReply {
 	text := strings.TrimSpace(reply[:idx] + reply[idx+end+len(suffix):])
 
 	return parsedReply{text: text, filePath: resolved}
+}
+
+// sessionKeyForChannel derives a stable, per-channel OpenClaw session key.
+// Using the Cliq channel ID ensures each DM thread gets its own AI context
+// and conversations do not bleed into one another.
+// Falls back to the legacy shared key only when channel is unknown (e.g. raw
+// payloads that could not be parsed).
+func sessionKeyForChannel(channelID string) string {
+	if channelID == "" {
+		return "hook:zoho-cliq"
+	}
+	return "zoho-cliq:" + channelID
 }
 
 type Dispatcher struct {
@@ -128,6 +139,8 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job worker.Job) error {
 }
 
 func (d *Dispatcher) forward(ctx context.Context, job worker.Job, p zohoMessagePayload) error {
+	sessionKey := sessionKeyForChannel(p.Message.Channel)
+
 	message := string(job.Payload)
 	if p.Message.Text != "" {
 		message = fmt.Sprintf("[Zoho Cliq] %s wrote in #%s: %s",
@@ -139,7 +152,7 @@ func (d *Dispatcher) forward(ctx context.Context, job worker.Job, p zohoMessageP
 	if err := d.gw.Forward(ctx, gateway.ForwardRequest{
 		Message:    message,
 		Name:       "Zoho Cliq",
-		SessionKey: "hook:zoho-cliq",
+		SessionKey: sessionKey,
 		RequestID:  job.RequestID,
 		ReceivedAt: job.ReceivedAt,
 	}); err != nil {
@@ -147,9 +160,11 @@ func (d *Dispatcher) forward(ctx context.Context, job worker.Job, p zohoMessageP
 	}
 
 	slog.Info("dispatcher: job forwarded to openclaw",
-		"request_id", job.RequestID)
+		"request_id", job.RequestID,
+		"session_key", sessionKey,
+	)
 
-	go d.postReply(job.RequestID, p.Message.Channel, dispatchTime)
+	go d.postReply(job.RequestID, p.Message.Channel, sessionKey, dispatchTime)
 
 	return nil
 }
@@ -175,10 +190,13 @@ func (d *Dispatcher) handleFile(ctx context.Context, job worker.Job, msg struct 
 		return fmt.Errorf("get zoho token for file download: %w", err)
 	}
 
+	sessionKey := sessionKeyForChannel(msg.Channel)
+
 	slog.Info("dispatcher: downloading and forwarding file",
 		"request_id", job.RequestID,
 		"filename", msg.AttachmentName,
 		"mime_type", msg.AttachmentMime,
+		"session_key", sessionKey,
 	)
 
 	dispatchTime := time.Now()
@@ -190,21 +208,23 @@ func (d *Dispatcher) handleFile(ctx context.Context, job worker.Job, msg struct 
 		msg.AttachmentMime,
 		token,
 		msg.Text,
-		"hook:zoho-cliq",
+		sessionKey,
 		d.workspaceDir,
 	); err != nil {
 		return fmt.Errorf("download and forward: %w", err)
 	}
 
 	slog.Info("dispatcher: file forwarded to openclaw",
-		"request_id", job.RequestID)
+		"request_id", job.RequestID,
+		"session_key", sessionKey,
+	)
 
-	go d.postReply(job.RequestID, msg.Channel, dispatchTime)
+	go d.postReply(job.RequestID, msg.Channel, sessionKey, dispatchTime)
 
 	return nil
 }
 
-func (d *Dispatcher) postReply(requestID, channel string, afterTime time.Time) {
+func (d *Dispatcher) postReply(requestID, channel, sessionKey string, afterTime time.Time) {
 	if d.sender == nil || d.sessionReader == nil || channel == "" {
 		slog.Info("dispatcher: reply-back skipped",
 			"has_sender", d.sender != nil,
@@ -221,7 +241,7 @@ func (d *Dispatcher) postReply(requestID, channel string, afterTime time.Time) {
 	defer fileTicker.Stop()
 
 	tryClaimFile := func() string {
-		f, err := d.sessionReader.FindLatestSessionFile(afterTime)
+		f, err := d.sessionReader.FindLatestSessionFile(afterTime, sessionKey)
 		if err != nil {
 			return ""
 		}
@@ -242,7 +262,9 @@ func (d *Dispatcher) postReply(requestID, channel string, afterTime time.Time) {
 		select {
 		case <-ctx.Done():
 			slog.Warn("dispatcher: timed out waiting for unclaimed session file",
-				"request_id", requestID)
+				"request_id", requestID,
+				"session_key", sessionKey,
+			)
 			return
 		case <-fileTicker.C:
 			if f := tryClaimFile(); f != "" {
@@ -256,7 +278,10 @@ found:
 	defer d.claimedSessions.Delete(sessionFile)
 
 	slog.Info("dispatcher: found session file, tailing for replies",
-		"request_id", requestID, "file", sessionFile)
+		"request_id", requestID,
+		"session_key", sessionKey,
+		"file", sessionFile,
+	)
 
 	out := make(chan string, 8)
 	go d.sessionReader.TailAssistantMessages(ctx, sessionFile, afterTime, out)
@@ -273,7 +298,9 @@ found:
 			d.deliverReply(ctx, requestID, channel, reply)
 		case <-ctx.Done():
 			slog.Info("dispatcher: reply timeout reached",
-				"request_id", requestID)
+				"request_id", requestID,
+				"session_key", sessionKey,
+			)
 			return
 		}
 	}
@@ -314,10 +341,11 @@ func (d *Dispatcher) deliverReply(ctx context.Context, requestID, channel, reply
 }
 
 func (d *Dispatcher) forwardRaw(ctx context.Context, job worker.Job) error {
+	// Channel is unknown for unparseable payloads; fall back to the shared key.
 	return d.gw.Forward(ctx, gateway.ForwardRequest{
 		Message:    string(job.Payload),
 		Name:       "Zoho Cliq",
-		SessionKey: "hook:zoho-cliq",
+		SessionKey: sessionKeyForChannel(""),
 		RequestID:  job.RequestID,
 		ReceivedAt: job.ReceivedAt,
 	})

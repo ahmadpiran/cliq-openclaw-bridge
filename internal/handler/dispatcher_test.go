@@ -20,15 +20,18 @@ type fakeForwarder struct {
 	forwardFileErr error
 	forwarded      atomic.Int32
 	fileForwarded  atomic.Int32
+	lastSessionKey string
 }
 
-func (f *fakeForwarder) Forward(_ context.Context, _ gateway.ForwardRequest) error {
+func (f *fakeForwarder) Forward(_ context.Context, req gateway.ForwardRequest) error {
 	f.forwarded.Add(1)
+	f.lastSessionKey = req.SessionKey
 	return f.forwardErr
 }
 
-func (f *fakeForwarder) DownloadAndForward(_ context.Context, _, _, _, _, _, _, _ string) error {
+func (f *fakeForwarder) DownloadAndForward(_ context.Context, _, _, _, _, _, sessionKey, _ string) error {
 	f.fileForwarded.Add(1)
+	f.lastSessionKey = sessionKey
 	return f.forwardFileErr
 }
 
@@ -66,13 +69,15 @@ func (f *fakeZohoSender) SendFile(_ context.Context, channel, filePath string) e
 }
 
 type fakeSessionReader struct {
-	reply    string
-	replyErr error
-	fileErr  error
-	calls    atomic.Int32
+	reply          string
+	replyErr       error
+	fileErr        error
+	calls          atomic.Int32
+	lastSessionKey string
 }
 
-func (f *fakeSessionReader) FindLatestSessionFile(_ time.Time) (string, error) {
+func (f *fakeSessionReader) FindLatestSessionFile(_ time.Time, sessionKey string) (string, error) {
+	f.lastSessionKey = sessionKey
 	return "fake.jsonl", f.fileErr
 }
 
@@ -99,7 +104,7 @@ type blockingSessionReader struct {
 	calls   atomic.Int32
 }
 
-func (b *blockingSessionReader) FindLatestSessionFile(_ time.Time) (string, error) {
+func (b *blockingSessionReader) FindLatestSessionFile(_ time.Time, _ string) (string, error) {
 	return b.file, b.fileErr
 }
 
@@ -260,6 +265,78 @@ func TestDispatcher_PostsReplyToZohoCliqAfterAgentResponds(t *testing.T) {
 	}
 	if sender.lastText != "Hey Ross! 👋" {
 		t.Errorf("wrong reply text: %s", sender.lastText)
+	}
+}
+
+func TestDispatcher_SessionKeyIsPerChannel(t *testing.T) {
+	// The session key forwarded to OpenClaw must embed the channel ID so each
+	// channel gets its own conversation context.
+	gw := &fakeForwarder{}
+	d := newDispatcher(gw, &fakeTokenProvider{}, nil, nil)
+
+	job := makeJob(t, map[string]any{
+		"type": "message",
+		"message": map[string]any{
+			"text":         "hello",
+			"sender":       "Ross",
+			"channel":      "CT_abc999",
+			"message_type": "text",
+		},
+	})
+
+	if err := d.Dispatch(context.Background(), job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := "zoho-cliq:CT_abc999"
+	if gw.lastSessionKey != want {
+		t.Errorf("expected session key %q, got %q", want, gw.lastSessionKey)
+	}
+}
+
+func TestDispatcher_SessionKeyFallsBackWhenChannelEmpty(t *testing.T) {
+	// Raw/unparseable payloads have no channel; the shared fallback key is used.
+	gw := &fakeForwarder{}
+	d := newDispatcher(gw, &fakeTokenProvider{}, nil, nil)
+
+	job := worker.Job{RequestID: "req-raw", Payload: []byte(`NOT_JSON`), ReceivedAt: time.Now()}
+	if err := d.Dispatch(context.Background(), job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := "hook:zoho-cliq"
+	if gw.lastSessionKey != want {
+		t.Errorf("expected fallback session key %q, got %q", want, gw.lastSessionKey)
+	}
+}
+
+func TestDispatcher_SessionKeyPassedToSessionReader(t *testing.T) {
+	// The session reader must receive the per-channel key so it can prefer the
+	// matching session file over any other recently modified file.
+	gw := &fakeForwarder{}
+	sender := &fakeZohoSender{}
+	reader := &fakeSessionReader{reply: "ok"}
+	d := newDispatcher(gw, &fakeTokenProvider{}, sender, reader)
+
+	job := makeJob(t, map[string]any{
+		"type": "message",
+		"message": map[string]any{
+			"text":         "hi",
+			"sender":       "Ross",
+			"channel":      "CT_xyz",
+			"message_type": "text",
+		},
+	})
+
+	if err := d.Dispatch(context.Background(), job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	want := "zoho-cliq:CT_xyz"
+	if reader.lastSessionKey != want {
+		t.Errorf("expected session reader to receive key %q, got %q", want, reader.lastSessionKey)
 	}
 }
 
