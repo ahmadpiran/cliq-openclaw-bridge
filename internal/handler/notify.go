@@ -8,26 +8,27 @@ import (
 	"net/http"
 )
 
-// NotifyHandler receives agent reply pushes from OpenClaw's message:sent hook
-// and forwards them to Zoho Cliq via the configured webhook sender.
 type NotifyHandler struct {
-	secret string
-	sender ZohoSender
+	secret       string
+	sender       ZohoSender
+	channel      string // default channel for push-path file delivery
+	workspaceDir string
 }
 
-// NewNotifyHandler constructs a NotifyHandler.
-// secret is compared against the X-Notify-Secret header in constant time.
-func NewNotifyHandler(secret string, sender ZohoSender) *NotifyHandler {
-	return &NotifyHandler{secret: secret, sender: sender}
+func NewNotifyHandler(secret string, sender ZohoSender, channel, workspaceDir string) *NotifyHandler {
+	return &NotifyHandler{
+		secret:       secret,
+		sender:       sender,
+		channel:      channel,
+		workspaceDir: workspaceDir,
+	}
 }
 
 type notifyPayload struct {
 	Text string `json:"text"`
 }
 
-// Handle processes POST /notify from the OpenClaw hook.
 func (h *NotifyHandler) Handle(w http.ResponseWriter, r *http.Request) {
-	// Validate shared secret — constant time to prevent timing attacks.
 	incoming := r.Header.Get("X-Notify-Secret")
 	if subtle.ConstantTimeCompare([]byte(incoming), []byte(h.secret)) != 1 {
 		slog.Warn("notify: invalid secret", "remote_addr", r.RemoteAddr)
@@ -35,7 +36,7 @@ func (h *NotifyHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1 MiB cap
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		slog.Error("notify: failed to read body", "error", err)
 		http.Error(w, "read error", http.StatusInternalServerError)
@@ -49,14 +50,24 @@ func (h *NotifyHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slog.Info("notify: posting agent reply to zoho cliq",
-		"reply_len", len(p.Text),
-	)
+	parsed := parseReply(p.Text, h.workspaceDir)
 
-	if err := h.sender.PostToChannel(r.Context(), "", p.Text); err != nil {
-		slog.Error("notify: failed to post to zoho cliq", "error", err)
-		http.Error(w, "delivery failed", http.StatusInternalServerError)
-		return
+	if parsed.text != "" {
+		slog.Info("notify: posting agent reply to zoho cliq",
+			"reply_len", len(parsed.text),
+		)
+		if err := h.sender.PostToChannel(r.Context(), h.channel, parsed.text); err != nil {
+			slog.Error("notify: failed to post to zoho cliq", "error", err)
+			http.Error(w, "delivery failed", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	if parsed.filePath != "" {
+		slog.Info("notify: sending file to zoho cliq", "file", parsed.filePath)
+		if err := h.sender.SendFile(r.Context(), h.channel, parsed.filePath); err != nil {
+			slog.Error("notify: failed to send file", "file", parsed.filePath, "error", err)
+		}
 	}
 
 	w.WriteHeader(http.StatusOK)

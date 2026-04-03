@@ -33,6 +33,7 @@ type ZohoConfig struct {
 	TokenKey            string
 	RedirectURI         string
 	CliqReplyWebhookURL string
+	CliqAPIURL          string
 }
 
 type OpenClawConfig struct {
@@ -78,6 +79,7 @@ func Load() (*Config, error) {
 		TokenKey:            envOr("ZOHO_TOKEN_KEY", "zoho:default"),
 		RedirectURI:         envOr("ZOHO_REDIRECT_URI", ""),
 		CliqReplyWebhookURL: envOr("ZOHO_REPLY_WEBHOOK_URL", ""),
+		CliqAPIURL:          envOr("ZOHO_CLIQ_API_URL", "https://cliq.zoho.com"),
 	}
 
 	cfg.OpenClaw = OpenClawConfig{

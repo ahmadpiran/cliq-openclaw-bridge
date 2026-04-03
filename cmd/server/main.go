@@ -68,10 +68,9 @@ func main() {
 	})
 
 	// --- Zoho Reply Sender ---
-	// Used by both the dispatcher (reply-back) and the notify handler (push).
 	var sender *zoho.Sender
 	if cfg.Zoho.CliqReplyWebhookURL != "" {
-		sender = zoho.NewSender(cfg.Zoho.CliqReplyWebhookURL)
+		sender = zoho.NewSender(cfg.Zoho.CliqReplyWebhookURL, cfg.Zoho.CliqAPIURL, refresher)
 		slog.Info("zoho reply webhook configured")
 	} else {
 		slog.Warn("ZOHO_REPLY_WEBHOOK_URL not set — reply-back disabled")
@@ -119,7 +118,12 @@ func main() {
 	oauthHandler := handler.NewOAuthHandler(refresher, cfg.Zoho.RedirectURI)
 	// NotifyHandler receives push from OpenClaw's message:sent hook.
 	// Wired and ready — activates automatically when OpenClaw implements the event.
-	notifyHandler := handler.NewNotifyHandler(cfg.Server.NotifySecret, sender)
+	notifyHandler := handler.NewNotifyHandler(
+		cfg.Server.NotifySecret,
+		sender,
+		"", // channel resolved per-message in polling path
+		cfg.OpenClaw.WorkspaceDir,
+	)
 
 	// --- Router ---
 	r := chi.NewRouter()

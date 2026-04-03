@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,8 +23,10 @@ type Forwarder interface {
 	DownloadAndForward(ctx context.Context, srcURL, filename, mimeType, zohoToken, comment, sessionKey, workspaceDir string) error
 }
 
+// ZohoSender is satisfied by *zoho.Sender.
 type ZohoSender interface {
 	PostToChannel(ctx context.Context, chatID, text string) error
+	SendFile(ctx context.Context, chatID, filePath string) error
 }
 
 type SessionReader interface {
@@ -44,9 +48,46 @@ type zohoMessagePayload struct {
 	} `json:"message"`
 }
 
-// Dispatcher routes jobs from the worker pool to the correct processing path.
-// claimedSessions prevents two reply goroutines from tailing the same session
-// file simultaneously, which would cause duplicate messages in Zoho Cliq.
+// parsedReply holds the text and optional file path extracted from an agent reply.
+type parsedReply struct {
+	text     string
+	filePath string // absolute path on disk, empty if no file
+}
+
+// parseReply extracts [FILE:path] tags from a reply.
+// The agent writes ~/workspace/... paths; we resolve them against workspaceDir.
+// Text with the tag stripped is returned alongside the resolved file path.
+func parseReply(reply, workspaceDir string) parsedReply {
+	const prefix = "[FILE:"
+	const suffix = "]"
+
+	idx := strings.Index(reply, prefix)
+	if idx == -1 {
+		return parsedReply{text: strings.TrimSpace(reply)}
+	}
+
+	end := strings.Index(reply[idx:], suffix)
+	if end == -1 {
+		return parsedReply{text: strings.TrimSpace(reply)}
+	}
+
+	rawPath := reply[idx+len(prefix) : idx+end]
+	rawPath = strings.TrimSpace(rawPath)
+
+	// Resolve ~/workspace/ → workspaceDir
+	resolved := rawPath
+	if strings.HasPrefix(rawPath, "~/workspace/") {
+		resolved = filepath.Join(workspaceDir, strings.TrimPrefix(rawPath, "~/workspace/"))
+	} else if strings.HasPrefix(rawPath, "~/workspace") {
+		resolved = workspaceDir
+	}
+
+	// Strip the tag from the text.
+	text := strings.TrimSpace(reply[:idx] + reply[idx+end+len(suffix):])
+
+	return parsedReply{text: text, filePath: resolved}
+}
+
 type Dispatcher struct {
 	gw              Forwarder
 	refresher       TokenProvider
@@ -54,7 +95,7 @@ type Dispatcher struct {
 	sessionReader   SessionReader
 	workspaceDir    string
 	replyTimeout    time.Duration
-	claimedSessions sync.Map // map[string]struct{} — session file path → claimed
+	claimedSessions sync.Map
 }
 
 func NewDispatcher(
@@ -167,9 +208,6 @@ func (d *Dispatcher) handleFile(ctx context.Context, job worker.Job, msg struct 
 	return nil
 }
 
-// postReply runs in a goroutine with its own context derived from Background.
-// It polls for an unclaimed session file, claims it exclusively, tails it for
-// replies, then releases the claim when done.
 func (d *Dispatcher) postReply(requestID, channel string, afterTime time.Time) {
 	if d.sender == nil || d.sessionReader == nil || channel == "" {
 		slog.Info("dispatcher: reply-back skipped",
@@ -186,16 +224,12 @@ func (d *Dispatcher) postReply(requestID, channel string, afterTime time.Time) {
 	fileTicker := time.NewTicker(1 * time.Second)
 	defer fileTicker.Stop()
 
-	// tryClaimFile attempts to find a session file created after afterTime and
-	// claim it exclusively. Returns the path on success, empty string otherwise.
 	tryClaimFile := func() string {
 		f, err := d.sessionReader.FindLatestSessionFile(afterTime)
 		if err != nil {
 			return ""
 		}
 		if _, alreadyClaimed := d.claimedSessions.LoadOrStore(f, struct{}{}); alreadyClaimed {
-			slog.Debug("dispatcher: session file already claimed, waiting for new one",
-				"request_id", requestID, "file", f)
 			return ""
 		}
 		return f
@@ -203,9 +237,6 @@ func (d *Dispatcher) postReply(requestID, channel string, afterTime time.Time) {
 
 	var sessionFile string
 
-	// Try immediately before waiting for the first tick. This keeps the
-	// reply-back goroutine fast in tests and in production when the agent
-	// responds quickly (within the first polling window).
 	if f := tryClaimFile(); f != "" {
 		sessionFile = f
 		goto found
@@ -243,19 +274,45 @@ found:
 			if reply == "" || reply == "NO_REPLY" {
 				continue
 			}
-			slog.Info("dispatcher: agent replied, posting to zoho cliq",
-				"request_id", requestID,
-				"channel", channel,
-				"reply_len", len(reply),
-			)
-			if err := d.sender.PostToChannel(ctx, channel, reply); err != nil {
-				slog.Error("dispatcher: failed to post reply",
-					"request_id", requestID, "error", err)
-			}
+			d.deliverReply(ctx, requestID, channel, reply)
 		case <-ctx.Done():
 			slog.Info("dispatcher: reply timeout reached",
 				"request_id", requestID)
 			return
+		}
+	}
+}
+
+// deliverReply sends text and/or a file from a single agent reply.
+func (d *Dispatcher) deliverReply(ctx context.Context, requestID, channel, reply string) {
+	parsed := parseReply(reply, d.workspaceDir)
+
+	// Send text part first if present.
+	if parsed.text != "" {
+		slog.Info("dispatcher: agent replied, posting to zoho cliq",
+			"request_id", requestID,
+			"channel", channel,
+			"reply_len", len(parsed.text),
+		)
+		if err := d.sender.PostToChannel(ctx, channel, parsed.text); err != nil {
+			slog.Error("dispatcher: failed to post text reply",
+				"request_id", requestID, "error", err)
+		}
+	}
+
+	// Send file part if present.
+	if parsed.filePath != "" {
+		slog.Info("dispatcher: sending file to zoho cliq",
+			"request_id", requestID,
+			"channel", channel,
+			"file", parsed.filePath,
+		)
+		if err := d.sender.SendFile(ctx, channel, parsed.filePath); err != nil {
+			slog.Error("dispatcher: failed to send file",
+				"request_id", requestID,
+				"file", parsed.filePath,
+				"error", err,
+			)
 		}
 	}
 }

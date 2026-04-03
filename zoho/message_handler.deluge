@@ -1,0 +1,79 @@
+// Zoho Cliq Bot — Message Handler
+// Install in: Settings → Bots & Tools → <your bot> → Message Handler
+//
+// This script forwards messages from Zoho Cliq to the cliq-openclaw-bridge,
+// which passes them to the OpenClaw AI gateway and routes replies back.
+
+webhookUrl = "https://your-domain.com/webhooks/zoho";
+secret = "replace_with_your_ZOHO_WEBHOOK_SECRET";
+
+triggerMap = Map();
+triggerMap.put("type", "incoming_message");
+
+messageMap = Map();
+messageMap.put("sender", user.get("first_name"));
+messageMap.put("channel", chat.get("id"));
+messageMap.put("channel_title", chat.get("title"));
+
+msgType = "text";
+msgText = "";
+
+// Guard: message can be null for some message types.
+if (message != null) {
+    msgText = message.toString();
+}
+
+// Detect file attachment via message_details.
+if (message_details != null) {
+    msgObj = message_details.get("message");
+    if (msgObj != null) {
+        detailType = msgObj.get("type");
+        if (detailType != null && detailType.toString() == "attachment") {
+            msgType = "file";
+            fileObj = msgObj.get("file");
+            if (fileObj != null) {
+                fileMap = fileObj.toMap();
+                messageMap.put("attachment_url", fileMap.get("url").toString());
+                messageMap.put("attachment_name", fileMap.get("name").toString());
+                messageMap.put("attachment_mime", fileMap.get("type").toString());
+            }
+            comment = msgObj.get("comment");
+            if (comment != null) {
+                msgText = comment.toString();
+            } else {
+                msgText = "";
+            }
+        }
+    }
+}
+
+messageMap.put("text", msgText);
+messageMap.put("message_type", msgType);
+
+payload = Map();
+payload.put("type", "message");
+payload.put("trigger", triggerMap);
+payload.put("message", messageMap);
+
+payloadString = payload.toString();
+info "Payload: " + payloadString;
+
+headerMap = Map();
+headerMap.put("X-Zoho-Webhook-Token", secret);
+headerMap.put("Content-Type", "application/json");
+
+response = invokeurl
+[
+    url: webhookUrl
+    type: POST
+    body: payloadString
+    headers: headerMap
+];
+
+responseText = "";
+if (response != null) {
+    responseText = response.toString();
+}
+info "Server Response: " + responseText;
+
+return {"text": "✓"};

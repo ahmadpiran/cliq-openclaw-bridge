@@ -42,10 +42,13 @@ func (f *fakeTokenProvider) ValidToken(_ context.Context) (string, error) {
 }
 
 type fakeZohoSender struct {
-	err         error
-	sent        atomic.Int32
-	lastChannel string
-	lastText    string
+	err          error
+	fileErr      error
+	sent         atomic.Int32
+	filesSent    atomic.Int32
+	lastChannel  string
+	lastText     string
+	lastFilePath string
 }
 
 func (f *fakeZohoSender) PostToChannel(_ context.Context, channel, text string) error {
@@ -53,6 +56,13 @@ func (f *fakeZohoSender) PostToChannel(_ context.Context, channel, text string) 
 	f.lastChannel = channel
 	f.lastText = text
 	return f.err
+}
+
+func (f *fakeZohoSender) SendFile(_ context.Context, channel, filePath string) error {
+	f.filesSent.Add(1)
+	f.lastChannel = channel
+	f.lastFilePath = filePath
+	return f.fileErr
 }
 
 type fakeSessionReader struct {
@@ -375,5 +385,39 @@ func TestDispatcher_ReplyBackSilentOnSenderFailure(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if sender.sent.Load() != 1 {
 		t.Error("sender must have been called even though it errored")
+	}
+}
+
+func TestDispatcher_SendsFileWhenReplyContainsFileTag(t *testing.T) {
+	gw := &fakeForwarder{}
+	sender := &fakeZohoSender{}
+	reader := &fakeSessionReader{reply: "Here is your report.\n[FILE:~/workspace/uploads/report.pdf]"}
+	d := handler.NewDispatcher(gw, &fakeTokenProvider{}, sender, reader, "/data/workspace", 5*time.Second)
+
+	job := makeJob(t, map[string]any{
+		"type": "message",
+		"message": map[string]any{
+			"text": "send me the file", "sender": "Ross",
+			"channel": "CT_123", "message_type": "text",
+		},
+	})
+
+	if err := d.Dispatch(context.Background(), job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	if sender.sent.Load() != 1 {
+		t.Errorf("expected 1 text post, got %d", sender.sent.Load())
+	}
+	if sender.lastText != "Here is your report." {
+		t.Errorf("wrong text: %q", sender.lastText)
+	}
+	if sender.filesSent.Load() != 1 {
+		t.Errorf("expected 1 file sent, got %d", sender.filesSent.Load())
+	}
+	if sender.lastFilePath != "/data/workspace/uploads/report.pdf" {
+		t.Errorf("wrong file path: %q", sender.lastFilePath)
 	}
 }
