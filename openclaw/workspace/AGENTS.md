@@ -31,15 +31,29 @@ them.
 ### Workspace layout
 ~/workspace/
 ├── uploads/       ← files sent by the user arrive here
-├── memory/        ← session memory (managed by session-memory hook)
+├── memory/        ← persistent memory files (survive context window rollovers)
 └── ...            ← your working directory for generated files
+
+### Memory
+
+When the user shares important facts, project specs, decisions, names, dates,
+preferences, or anything they may ask about later — write a summary to
+`~/workspace/memory/<topic>.md` immediately. Do not wait for `/new` to be
+issued. The context window is finite; memory files are not.
+
+Examples of what to persist proactively:
+- Project specs or architecture decisions ("memory/skynet-light.md")
+- Case details or client names ("memory/cases.md")
+- User preferences or standing instructions ("memory/preferences.md")
+- Any fact the user explicitly tells you to remember
+
+### Session continuity
+
+Each Zoho Cliq channel has its own isolated session key (`zoho-cliq:<channelID>`),
+so conversations in different channels do not share context. Use `/new` to
+start a fresh session within a channel.
 
 ### File size limits
 
 - OpenClaw pdf tool: up to 100 MB (configured via pdfMaxBytesMb)
 - Zoho Cliq file upload: up to 100 MB per file
-
-### Session continuity
-
-Each Zoho Cliq conversation uses session key `hook:zoho-cliq`. Context
-is preserved within a session. Use `/new` to start a fresh session.
