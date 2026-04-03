@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -57,6 +56,7 @@ type parsedReply struct {
 // parseReply extracts [FILE:path] tags from a reply.
 // The agent writes ~/workspace/... paths; we resolve them against workspaceDir.
 // Text with the tag stripped is returned alongside the resolved file path.
+
 func parseReply(reply, workspaceDir string) parsedReply {
 	const prefix = "[FILE:"
 	const suffix = "]"
@@ -71,18 +71,14 @@ func parseReply(reply, workspaceDir string) parsedReply {
 		return parsedReply{text: strings.TrimSpace(reply)}
 	}
 
-	rawPath := reply[idx+len(prefix) : idx+end]
-	rawPath = strings.TrimSpace(rawPath)
+	rawPath := strings.TrimSpace(reply[idx+len(prefix) : idx+end])
 
-	// Resolve ~/workspace/ → workspaceDir
 	resolved := rawPath
 	if strings.HasPrefix(rawPath, "~/workspace/") {
-		resolved = filepath.Join(workspaceDir, strings.TrimPrefix(rawPath, "~/workspace/"))
-	} else if strings.HasPrefix(rawPath, "~/workspace") {
-		resolved = workspaceDir
+		// Join with forward slash regardless of OS — container paths are Linux.
+		resolved = workspaceDir + "/" + strings.TrimPrefix(rawPath, "~/workspace/")
 	}
 
-	// Strip the tag from the text.
 	text := strings.TrimSpace(reply[:idx] + reply[idx+end+len(suffix):])
 
 	return parsedReply{text: text, filePath: resolved}

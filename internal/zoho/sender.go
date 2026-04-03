@@ -11,52 +11,72 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
 const senderTimeout = 10 * time.Second
 const fileUploadTimeout = 60 * time.Second
 
-// TokenProvider is satisfied by *Refresher.
-type SenderTokenProvider interface {
-	ValidToken(ctx context.Context) (string, error)
-}
-
 // Sender posts messages and files back to Zoho Cliq.
-// Text replies use the bot webhook token (no OAuth).
-// File uploads use OAuth via the Files REST API.
+// Both text replies and file uploads use the bot webhook zapikey — no OAuth needed.
 type Sender struct {
-	webhookURL string
-	cliqAPIURL string
-	refresher  SenderTokenProvider
+	webhookURL string // e.g. https://cliq.zoho.com/api/v2/bots/mybotname/message?zapikey=xxx
+	cliqAPIURL string // e.g. https://cliq.zoho.com
+	botName    string // extracted from webhookURL
+	zapiKey    string // extracted from webhookURL
 	http       *http.Client
 }
 
 // NewSender constructs a Sender.
-// webhookURL is the Zoho Cliq incoming webhook URL for text replies.
-// cliqAPIURL is the Zoho Cliq API base (default: https://cliq.zoho.com).
-// refresher is used for file upload OAuth — may be nil if file sending is not needed.
-func NewSender(webhookURL, cliqAPIURL string, refresher SenderTokenProvider) *Sender {
+// webhookURL must be the full Zoho bot message webhook URL including zapikey.
+// cliqAPIURL is the Zoho Cliq API base — leave empty to use https://cliq.zoho.com.
+func NewSender(webhookURL, cliqAPIURL string) *Sender {
 	if cliqAPIURL == "" {
 		cliqAPIURL = "https://cliq.zoho.com"
 	}
+
+	botName, zapiKey := parseBotWebhookURL(webhookURL)
+
 	return &Sender{
 		webhookURL: webhookURL,
 		cliqAPIURL: cliqAPIURL,
-		refresher:  refresher,
+		botName:    botName,
+		zapiKey:    zapiKey,
 		http:       &http.Client{Timeout: senderTimeout},
 	}
+}
+
+// parseBotWebhookURL extracts the bot name and zapikey from a Zoho bot webhook URL.
+// Expected format: https://cliq.zoho.com/api/v2/bots/{botname}/message?zapikey={key}
+func parseBotWebhookURL(rawURL string) (botName, zapiKey string) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", ""
+	}
+
+	zapiKey = u.Query().Get("zapikey")
+
+	// Extract bot name from path: /api/v2/bots/{botname}/message
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	for i, p := range parts {
+		if p == "bots" && i+1 < len(parts) {
+			botName = parts[i+1]
+			break
+		}
+	}
+
+	return botName, zapiKey
 }
 
 type cliqMessagePayload struct {
 	Text string `json:"text"`
 }
 
-// PostToChannel posts a text reply to Zoho Cliq via the incoming webhook.
-// chatID is accepted for interface compatibility but not used for text —
-// the webhook URL already encodes the destination.
+// PostToChannel posts a text reply to Zoho Cliq via the bot webhook URL.
 func (s *Sender) PostToChannel(ctx context.Context, _ string, text string) error {
 	body, err := json.Marshal(cliqMessagePayload{Text: text})
 	if err != nil {
@@ -84,18 +104,11 @@ func (s *Sender) PostToChannel(ctx context.Context, _ string, text string) error
 	return nil
 }
 
-// SendFile uploads a file to a Zoho Cliq chat via the REST API.
-// Requires OAuth — refresher must be non-nil.
-// chatID is the Cliq chat ID, e.g. CT_1424569719276050237_918941379-B2.
-// filePath is the absolute path to the file on disk.
-func (s *Sender) SendFile(ctx context.Context, chatID, filePath string) error {
-	if s.refresher == nil {
-		return fmt.Errorf("SendFile: no token refresher configured")
-	}
-
-	token, err := s.refresher.ValidToken(ctx)
-	if err != nil {
-		return fmt.Errorf("get oauth token for file upload: %w", err)
+// SendFile uploads a file to the Zoho Cliq bot using the zapikey from the webhook URL.
+// No OAuth token required — the zapikey covers both messages and file uploads.
+func (s *Sender) SendFile(ctx context.Context, _ string, filePath string) error {
+	if s.zapiKey == "" || s.botName == "" {
+		return fmt.Errorf("SendFile: could not extract bot name or zapikey from webhook URL")
 	}
 
 	f, err := os.Open(filePath)
@@ -110,7 +123,6 @@ func (s *Sender) SendFile(ctx context.Context, chatID, filePath string) error {
 		mimeType = "application/octet-stream"
 	}
 
-	// Build multipart body.
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 
@@ -128,7 +140,8 @@ func (s *Sender) SendFile(ctx context.Context, chatID, filePath string) error {
 	}
 	mw.Close()
 
-	uploadURL := fmt.Sprintf("%s/api/v2/chats/%s/files", s.cliqAPIURL, chatID)
+	uploadURL := fmt.Sprintf("%s/api/v2/bots/%s/files?zapikey=%s",
+		s.cliqAPIURL, s.botName, s.zapiKey)
 
 	uploadCtx, cancel := context.WithTimeout(ctx, fileUploadTimeout)
 	defer cancel()
@@ -137,7 +150,6 @@ func (s *Sender) SendFile(ctx context.Context, chatID, filePath string) error {
 	if err != nil {
 		return fmt.Errorf("build file upload request: %w", err)
 	}
-	req.Header.Set("Authorization", "Zoho-oauthtoken "+token)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 
 	uploadClient := &http.Client{Timeout: fileUploadTimeout}
@@ -153,7 +165,6 @@ func (s *Sender) SendFile(ctx context.Context, chatID, filePath string) error {
 	}
 
 	slog.Info("zoho cliq file sent",
-		"chat_id", chatID,
 		"filename", filename,
 		"status", resp.StatusCode,
 	)

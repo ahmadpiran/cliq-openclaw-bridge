@@ -136,8 +136,8 @@ func TestLoad_InvalidDurationFallsBackToDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.Worker.JobTimeout != 150*time.Second {
-		t.Errorf("expected default 150s job timeout on bad input, got %s", cfg.Worker.JobTimeout)
+	if cfg.Worker.JobTimeout != 90*time.Second {
+		t.Errorf("expected default 90s job timeout on bad input, got %s", cfg.Worker.JobTimeout)
 	}
 }
 
