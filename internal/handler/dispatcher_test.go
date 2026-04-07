@@ -45,20 +45,39 @@ func (f *fakeTokenProvider) ValidToken(_ context.Context) (string, error) {
 }
 
 type fakeZohoSender struct {
-	err          error
-	fileErr      error
-	sent         atomic.Int32
-	filesSent    atomic.Int32
-	lastChannel  string
-	lastText     string
-	lastFilePath string
+	postErr         error
+	fileErr         error
+	placeholderErr  error
+	updateErr       error
+	sent            atomic.Int32
+	filesSent       atomic.Int32
+	placeholders    atomic.Int32
+	updates         atomic.Int32
+	lastChannel     string
+	lastText        string
+	lastFilePath    string
+	lastUpdatedText string
+	placeholderID   string // returned by SendPlaceholder
 }
 
 func (f *fakeZohoSender) PostToChannel(_ context.Context, channel, text string) error {
 	f.sent.Add(1)
 	f.lastChannel = channel
 	f.lastText = text
-	return f.err
+	return f.postErr
+}
+
+func (f *fakeZohoSender) SendPlaceholder(_ context.Context, channel, _ string) (string, error) {
+	f.placeholders.Add(1)
+	f.lastChannel = channel
+	return f.placeholderID, f.placeholderErr
+}
+
+func (f *fakeZohoSender) UpdateMessage(_ context.Context, channel, _ string, text string) error {
+	f.updates.Add(1)
+	f.lastChannel = channel
+	f.lastUpdatedText = text
+	return f.updateErr
 }
 
 func (f *fakeZohoSender) SendFile(_ context.Context, channel, filePath string) error {
@@ -112,7 +131,6 @@ func (b *blockingSessionReader) TailAssistantMessages(
 	ctx context.Context, _ string, _ time.Time, out chan<- string,
 ) {
 	b.calls.Add(1)
-	// Block until released or context done, then optionally send a reply.
 	select {
 	case <-b.release:
 		if b.reply != "" {
@@ -231,9 +249,10 @@ func TestDispatcher_ErrorWhenTokenProviderFails(t *testing.T) {
 	}
 }
 
-func TestDispatcher_PostsReplyToZohoCliqAfterAgentResponds(t *testing.T) {
+func TestDispatcher_SendsPlaceholderAndUpdatesWithReply(t *testing.T) {
+	// Happy path: placeholder is sent first, then updated with the real reply.
 	gw := &fakeForwarder{}
-	sender := &fakeZohoSender{}
+	sender := &fakeZohoSender{placeholderID: "msg-placeholder-001"}
 	reader := &fakeSessionReader{reply: "Hey Ross! 👋"}
 	d := newDispatcher(gw, &fakeTokenProvider{}, sender, reader)
 
@@ -254,23 +273,93 @@ func TestDispatcher_PostsReplyToZohoCliqAfterAgentResponds(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	if gw.forwarded.Load() != 1 {
-		t.Errorf("expected 1 forward call, got %d", gw.forwarded.Load())
+	if sender.placeholders.Load() != 1 {
+		t.Errorf("expected 1 placeholder sent, got %d", sender.placeholders.Load())
 	}
-	if sender.sent.Load() != 1 {
-		t.Errorf("expected 1 reply sent, got %d", sender.sent.Load())
+	if sender.updates.Load() != 1 {
+		t.Errorf("expected 1 UpdateMessage call, got %d", sender.updates.Load())
+	}
+	if sender.lastUpdatedText != "Hey Ross! 👋" {
+		t.Errorf("wrong updated text: %s", sender.lastUpdatedText)
+	}
+	// PostToChannel must NOT be called — we updated instead.
+	if sender.sent.Load() != 0 {
+		t.Errorf("PostToChannel must not be called when placeholder update succeeds, got %d", sender.sent.Load())
 	}
 	if sender.lastChannel != "CT_123" {
 		t.Errorf("wrong channel: %s", sender.lastChannel)
 	}
-	if sender.lastText != "Hey Ross! 👋" {
-		t.Errorf("wrong reply text: %s", sender.lastText)
+}
+
+func TestDispatcher_FallsBackToPostWhenPlaceholderFails(t *testing.T) {
+	// If SendPlaceholder fails, postReply should still deliver the reply via PostToChannel.
+	gw := &fakeForwarder{}
+	sender := &fakeZohoSender{placeholderErr: errors.New("oauth unavailable")}
+	reader := &fakeSessionReader{reply: "Hey!"}
+	d := newDispatcher(gw, &fakeTokenProvider{}, sender, reader)
+
+	job := makeJob(t, map[string]any{
+		"type": "message",
+		"message": map[string]any{
+			"text": "hi", "sender": "Ross",
+			"channel": "CT_123", "message_type": "text",
+		},
+	})
+
+	if err := d.Dispatch(context.Background(), job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	if sender.placeholders.Load() != 1 {
+		t.Errorf("SendPlaceholder should have been attempted, got %d", sender.placeholders.Load())
+	}
+	if sender.updates.Load() != 0 {
+		t.Error("UpdateMessage must not be called when placeholder ID is empty")
+	}
+	if sender.sent.Load() != 1 {
+		t.Errorf("expected fallback PostToChannel, got %d", sender.sent.Load())
+	}
+	if sender.lastText != "Hey!" {
+		t.Errorf("wrong fallback text: %s", sender.lastText)
+	}
+}
+
+func TestDispatcher_FallsBackToPostWhenUpdateFails(t *testing.T) {
+	// If UpdateMessage fails, postReply should fall back to PostToChannel.
+	gw := &fakeForwarder{}
+	sender := &fakeZohoSender{
+		placeholderID: "msg-001",
+		updateErr:     errors.New("message not found"),
+	}
+	reader := &fakeSessionReader{reply: "Hello!"}
+	d := newDispatcher(gw, &fakeTokenProvider{}, sender, reader)
+
+	job := makeJob(t, map[string]any{
+		"type": "message",
+		"message": map[string]any{
+			"text": "hi", "sender": "Ross",
+			"channel": "CT_123", "message_type": "text",
+		},
+	})
+
+	if err := d.Dispatch(context.Background(), job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	if sender.updates.Load() != 1 {
+		t.Errorf("UpdateMessage should have been attempted once, got %d", sender.updates.Load())
+	}
+	if sender.sent.Load() != 1 {
+		t.Errorf("expected 1 fallback PostToChannel call, got %d", sender.sent.Load())
+	}
+	if sender.lastText != "Hello!" {
+		t.Errorf("wrong fallback text: %s", sender.lastText)
 	}
 }
 
 func TestDispatcher_SessionKeyIsPerChannel(t *testing.T) {
-	// The session key forwarded to OpenClaw must embed the channel ID so each
-	// channel gets its own conversation context.
 	gw := &fakeForwarder{}
 	d := newDispatcher(gw, &fakeTokenProvider{}, nil, nil)
 
@@ -288,14 +377,13 @@ func TestDispatcher_SessionKeyIsPerChannel(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	want := "zoho-cliq:CT_abc999"
+	want := "hook:zoho-cliq:CT_abc999"
 	if gw.lastSessionKey != want {
 		t.Errorf("expected session key %q, got %q", want, gw.lastSessionKey)
 	}
 }
 
 func TestDispatcher_SessionKeyFallsBackWhenChannelEmpty(t *testing.T) {
-	// Raw/unparseable payloads have no channel; the shared fallback key is used.
 	gw := &fakeForwarder{}
 	d := newDispatcher(gw, &fakeTokenProvider{}, nil, nil)
 
@@ -311,10 +399,8 @@ func TestDispatcher_SessionKeyFallsBackWhenChannelEmpty(t *testing.T) {
 }
 
 func TestDispatcher_SessionKeyPassedToSessionReader(t *testing.T) {
-	// The session reader must receive the per-channel key so it can prefer the
-	// matching session file over any other recently modified file.
 	gw := &fakeForwarder{}
-	sender := &fakeZohoSender{}
+	sender := &fakeZohoSender{placeholderID: "ph-1"}
 	reader := &fakeSessionReader{reply: "ok"}
 	d := newDispatcher(gw, &fakeTokenProvider{}, sender, reader)
 
@@ -331,10 +417,9 @@ func TestDispatcher_SessionKeyPassedToSessionReader(t *testing.T) {
 	if err := d.Dispatch(context.Background(), job); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
 	time.Sleep(300 * time.Millisecond)
 
-	want := "zoho-cliq:CT_xyz"
+	want := "hook:zoho-cliq:CT_xyz"
 	if reader.lastSessionKey != want {
 		t.Errorf("expected session reader to receive key %q, got %q", want, reader.lastSessionKey)
 	}
@@ -342,7 +427,7 @@ func TestDispatcher_SessionKeyPassedToSessionReader(t *testing.T) {
 
 func TestDispatcher_NoDuplicatesWhenTwoJobsRaceForSameSessionFile(t *testing.T) {
 	gw := &fakeForwarder{}
-	sender := &fakeZohoSender{}
+	sender := &fakeZohoSender{placeholderID: "ph-race"}
 	release := make(chan struct{})
 	reader := &blockingSessionReader{
 		file:    "shared.jsonl",
@@ -368,18 +453,17 @@ func TestDispatcher_NoDuplicatesWhenTwoJobsRaceForSameSessionFile(t *testing.T) 
 	})
 
 	_ = d.Dispatch(context.Background(), jobA)
-	// Give goroutine A time to run its immediate tryClaimFile and register the claim.
 	time.Sleep(100 * time.Millisecond)
 	_ = d.Dispatch(context.Background(), jobB)
-	// Give goroutine B time to attempt and fail to claim the file.
 	time.Sleep(100 * time.Millisecond)
 
-	// Release goroutine A — it sends its reply and releases the claim.
 	close(release)
 	time.Sleep(300 * time.Millisecond)
 
-	if n := sender.sent.Load(); n != 1 {
-		t.Errorf("expected exactly 1 reply sent, got %d (duplicate suppression failed)", n)
+	// One placeholder per job, but only one reply delivered.
+	totalDeliveries := sender.updates.Load() + sender.sent.Load()
+	if totalDeliveries != 1 {
+		t.Errorf("expected exactly 1 reply delivered, got %d (duplicate suppression failed)", totalDeliveries)
 	}
 }
 
@@ -423,7 +507,10 @@ func TestDispatcher_NoReplyWhenChannelIsEmpty(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	time.Sleep(100 * time.Millisecond)
-	if sender.sent.Load() != 0 {
+	if sender.placeholders.Load() != 0 {
+		t.Error("placeholder must not be sent when channel is empty")
+	}
+	if sender.updates.Load()+sender.sent.Load() != 0 {
 		t.Error("reply must not be sent when channel is empty")
 	}
 }
@@ -444,7 +531,11 @@ func TestDispatcher_ForwardErrorPropagates(t *testing.T) {
 
 func TestDispatcher_ReplyBackSilentOnSenderFailure(t *testing.T) {
 	gw := &fakeForwarder{}
-	sender := &fakeZohoSender{err: errors.New("zoho api down")}
+	sender := &fakeZohoSender{
+		placeholderID: "ph-fail",
+		updateErr:     errors.New("zoho api down"),
+		postErr:       errors.New("zoho api down"),
+	}
 	reader := &fakeSessionReader{reply: "Hey!"}
 	d := newDispatcher(gw, &fakeTokenProvider{}, sender, reader)
 
@@ -460,14 +551,18 @@ func TestDispatcher_ReplyBackSilentOnSenderFailure(t *testing.T) {
 		t.Fatalf("sender failure should not fail the job, got: %v", err)
 	}
 	time.Sleep(300 * time.Millisecond)
+	// Both update and fallback post were attempted.
+	if sender.updates.Load() != 1 {
+		t.Errorf("UpdateMessage should have been called once, got %d", sender.updates.Load())
+	}
 	if sender.sent.Load() != 1 {
-		t.Error("sender must have been called even though it errored")
+		t.Errorf("fallback PostToChannel should have been called once, got %d", sender.sent.Load())
 	}
 }
 
 func TestDispatcher_SendsFileWhenReplyContainsFileTag(t *testing.T) {
 	gw := &fakeForwarder{}
-	sender := &fakeZohoSender{}
+	sender := &fakeZohoSender{placeholderID: "ph-file"}
 	reader := &fakeSessionReader{reply: "Here is your report.\n[FILE:~/workspace/uploads/report.pdf]"}
 	d := handler.NewDispatcher(gw, &fakeTokenProvider{}, sender, reader, "/data/workspace", 5*time.Second)
 
@@ -485,16 +580,22 @@ func TestDispatcher_SendsFileWhenReplyContainsFileTag(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	if sender.sent.Load() != 1 {
-		t.Errorf("expected 1 text post, got %d", sender.sent.Load())
+	// Text part should update the placeholder.
+	if sender.updates.Load() != 1 {
+		t.Errorf("expected 1 UpdateMessage call, got %d", sender.updates.Load())
 	}
-	if sender.lastText != "Here is your report." {
-		t.Errorf("wrong text: %q", sender.lastText)
+	if sender.lastUpdatedText != "Here is your report." {
+		t.Errorf("wrong updated text: %q", sender.lastUpdatedText)
 	}
+	// File should also be sent.
 	if sender.filesSent.Load() != 1 {
 		t.Errorf("expected 1 file sent, got %d", sender.filesSent.Load())
 	}
 	if sender.lastFilePath != "/data/workspace/uploads/report.pdf" {
 		t.Errorf("wrong file path: %q", sender.lastFilePath)
+	}
+	// PostToChannel must not be called (update succeeded).
+	if sender.sent.Load() != 0 {
+		t.Errorf("PostToChannel must not be called when update succeeds, got %d", sender.sent.Load())
 	}
 }

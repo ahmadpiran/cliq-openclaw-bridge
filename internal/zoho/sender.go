@@ -21,20 +21,20 @@ import (
 const senderTimeout = 10 * time.Second
 const fileUploadTimeout = 60 * time.Second
 
-// Sender posts messages and files back to Zoho Cliq.
-// Both text replies and file uploads use the bot webhook zapikey — no OAuth needed.
+type TokenProvider interface {
+	ValidToken(ctx context.Context) (string, error)
+}
+
 type Sender struct {
 	webhookURL string // e.g. https://cliq.zoho.com/api/v2/bots/mybotname/message?zapikey=xxx
 	cliqAPIURL string // e.g. https://cliq.zoho.com
 	botName    string // extracted from webhookURL
 	zapiKey    string // extracted from webhookURL
+	refresher  TokenProvider
 	http       *http.Client
 }
 
-// NewSender constructs a Sender.
-// webhookURL must be the full Zoho bot message webhook URL including zapikey.
-// cliqAPIURL is the Zoho Cliq API base — leave empty to use https://cliq.zoho.com.
-func NewSender(webhookURL, cliqAPIURL string) *Sender {
+func NewSender(webhookURL, cliqAPIURL string, refresher TokenProvider) *Sender {
 	if cliqAPIURL == "" {
 		cliqAPIURL = "https://cliq.zoho.com"
 	}
@@ -46,6 +46,7 @@ func NewSender(webhookURL, cliqAPIURL string) *Sender {
 		cliqAPIURL: cliqAPIURL,
 		botName:    botName,
 		zapiKey:    zapiKey,
+		refresher:  refresher,
 		http:       &http.Client{Timeout: senderTimeout},
 	}
 }
@@ -76,7 +77,12 @@ type cliqMessagePayload struct {
 	Text string `json:"text"`
 }
 
+type cliqMessageResponse struct {
+	ID string `json:"id"`
+}
+
 // PostToChannel posts a text reply to Zoho Cliq via the bot webhook URL.
+// Use this for replies that do not need in-place updating.
 func (s *Sender) PostToChannel(ctx context.Context, _ string, text string) error {
 	body, err := json.Marshal(cliqMessagePayload{Text: text})
 	if err != nil {
@@ -101,6 +107,85 @@ func (s *Sender) PostToChannel(ctx context.Context, _ string, text string) error
 	}
 
 	slog.Info("zoho cliq reply sent via webhook", "status", resp.StatusCode)
+	return nil
+}
+
+func (s *Sender) SendPlaceholder(ctx context.Context, chatID, text string) (string, error) {
+	token, err := s.refresher.ValidToken(ctx)
+	if err != nil {
+		return "", fmt.Errorf("get oauth token for placeholder: %w", err)
+	}
+
+	body, err := json.Marshal(cliqMessagePayload{Text: text})
+	if err != nil {
+		return "", fmt.Errorf("marshal placeholder payload: %w", err)
+	}
+
+	endpoint := fmt.Sprintf("%s/api/v2/chats/%s/messages", s.cliqAPIURL, chatID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("build placeholder request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Zoho-oauthtoken "+token)
+
+	resp, err := s.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("send placeholder: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("placeholder status %d: %s", resp.StatusCode, string(raw))
+	}
+
+	var msgResp cliqMessageResponse
+	if err := json.Unmarshal(raw, &msgResp); err != nil {
+		return "", fmt.Errorf("decode placeholder response: %w", err)
+	}
+	if msgResp.ID == "" {
+		return "", fmt.Errorf("placeholder response missing message id")
+	}
+
+	slog.Info("zoho cliq placeholder sent", "chat_id", chatID, "message_id", msgResp.ID)
+	return msgResp.ID, nil
+}
+
+func (s *Sender) UpdateMessage(ctx context.Context, chatID, messageID, text string) error {
+	token, err := s.refresher.ValidToken(ctx)
+	if err != nil {
+		return fmt.Errorf("get oauth token for message update: %w", err)
+	}
+
+	body, err := json.Marshal(cliqMessagePayload{Text: text})
+	if err != nil {
+		return fmt.Errorf("marshal update payload: %w", err)
+	}
+
+	endpoint := fmt.Sprintf("%s/api/v2/chats/%s/messages/%s", s.cliqAPIURL, chatID, messageID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build update request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Zoho-oauthtoken "+token)
+
+	resp, err := s.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("update message: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("update message status %d: %s", resp.StatusCode, string(raw))
+	}
+
+	slog.Info("zoho cliq placeholder updated with reply",
+		"chat_id", chatID,
+		"message_id", messageID,
+	)
 	return nil
 }
 

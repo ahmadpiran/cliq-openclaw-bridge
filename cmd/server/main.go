@@ -70,7 +70,7 @@ func main() {
 	// --- Zoho Reply Sender ---
 	var sender *zoho.Sender
 	if cfg.Zoho.CliqReplyWebhookURL != "" {
-		sender = zoho.NewSender(cfg.Zoho.CliqReplyWebhookURL, cfg.Zoho.CliqAPIURL)
+		sender = zoho.NewSender(cfg.Zoho.CliqReplyWebhookURL, cfg.Zoho.CliqAPIURL, refresher)
 		slog.Info("zoho reply webhook configured")
 	} else {
 		slog.Warn("ZOHO_REPLY_WEBHOOK_URL not set — reply-back disabled")
