@@ -25,8 +25,6 @@ type Forwarder interface {
 // ZohoSender is satisfied by *zoho.Sender.
 type ZohoSender interface {
 	PostToChannel(ctx context.Context, chatID, text string) error
-	SendPlaceholder(ctx context.Context, chatID, text string) (string, error)
-	UpdateMessage(ctx context.Context, chatID, messageID, text string) error
 	SendFile(ctx context.Context, chatID, filePath string) error
 }
 
@@ -231,17 +229,6 @@ func (d *Dispatcher) postReply(requestID, channel, sessionKey string, afterTime 
 	ctx, cancel := context.WithTimeout(context.Background(), d.replyTimeout)
 	defer cancel()
 
-	placeholderID := ""
-	if pid, err := d.sender.SendPlaceholder(ctx, channel, "⏳"); err != nil {
-		slog.Warn("dispatcher: failed to send typing placeholder, will post reply as new message",
-			"request_id", requestID,
-			"channel", channel,
-			"error", err,
-		)
-	} else {
-		placeholderID = pid
-	}
-
 	fileTicker := time.NewTicker(1 * time.Second)
 	defer fileTicker.Stop()
 
@@ -291,7 +278,6 @@ found:
 	out := make(chan string, 8)
 	go d.sessionReader.TailAssistantMessages(ctx, sessionFile, afterTime, out)
 
-	firstReply := true
 	for {
 		select {
 		case reply, ok := <-out:
@@ -301,14 +287,7 @@ found:
 			if reply == "" || reply == "NO_REPLY" {
 				continue
 			}
-			// The first reply replaces the placeholder; subsequent replies
-			// (multi-turn tool results) post as new messages.
-			pid := ""
-			if firstReply {
-				pid = placeholderID
-				firstReply = false
-			}
-			d.deliverReply(ctx, requestID, channel, reply, pid)
+			d.deliverReply(ctx, requestID, channel, reply)
 		case <-ctx.Done():
 			slog.Info("dispatcher: reply timeout reached",
 				"request_id", requestID,
@@ -319,38 +298,19 @@ found:
 	}
 }
 
-func (d *Dispatcher) deliverReply(ctx context.Context, requestID, channel, reply, placeholderID string) {
+// deliverReply sends text and/or a file from a single agent reply.
+func (d *Dispatcher) deliverReply(ctx context.Context, requestID, channel, reply string) {
 	parsed := parseReply(reply, d.workspaceDir)
 
 	if parsed.text != "" {
-		if placeholderID != "" {
-			slog.Info("dispatcher: updating placeholder with agent reply",
-				"request_id", requestID,
-				"channel", channel,
-				"message_id", placeholderID,
-				"reply_len", len(parsed.text),
-			)
-			if err := d.sender.UpdateMessage(ctx, channel, placeholderID, parsed.text); err != nil {
-				slog.Warn("dispatcher: placeholder update failed, posting as new message",
-					"request_id", requestID,
-					"message_id", placeholderID,
-					"error", err,
-				)
-				if err2 := d.sender.PostToChannel(ctx, channel, parsed.text); err2 != nil {
-					slog.Error("dispatcher: fallback PostToChannel also failed",
-						"request_id", requestID, "error", err2)
-				}
-			}
-		} else {
-			slog.Info("dispatcher: agent replied, posting to zoho cliq",
-				"request_id", requestID,
-				"channel", channel,
-				"reply_len", len(parsed.text),
-			)
-			if err := d.sender.PostToChannel(ctx, channel, parsed.text); err != nil {
-				slog.Error("dispatcher: failed to post text reply",
-					"request_id", requestID, "error", err)
-			}
+		slog.Info("dispatcher: agent replied, posting to zoho cliq",
+			"request_id", requestID,
+			"channel", channel,
+			"reply_len", len(parsed.text),
+		)
+		if err := d.sender.PostToChannel(ctx, channel, parsed.text); err != nil {
+			slog.Error("dispatcher: failed to post text reply",
+				"request_id", requestID, "error", err)
 		}
 	}
 
