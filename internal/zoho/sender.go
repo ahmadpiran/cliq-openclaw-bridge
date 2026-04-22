@@ -21,6 +21,11 @@ import (
 const senderTimeout = 10 * time.Second
 const fileUploadTimeout = 60 * time.Second
 
+// Sender posts messages and files back to Zoho Cliq.
+// Both text replies and file uploads use the bot webhook zapikey — no OAuth needed.
+//
+// Note: Zoho Cliq's external bot API does not expose message IDs or support
+// message editing via webhooks, so update-in-place is not possible.
 type Sender struct {
 	webhookURL string // e.g. https://cliq.zoho.com/api/v2/bots/mybotname/message?zapikey=xxx
 	cliqAPIURL string // e.g. https://cliq.zoho.com
@@ -29,6 +34,9 @@ type Sender struct {
 	http       *http.Client
 }
 
+// NewSender constructs a Sender.
+// webhookURL must be the full Zoho bot message webhook URL including zapikey.
+// cliqAPIURL is the Zoho Cliq API base — leave empty to use https://cliq.zoho.com.
 func NewSender(webhookURL, cliqAPIURL string) *Sender {
 	if cliqAPIURL == "" {
 		cliqAPIURL = "https://cliq.zoho.com"
@@ -67,13 +75,21 @@ func parseBotWebhookURL(rawURL string) (botName, zapiKey string) {
 	return botName, zapiKey
 }
 
+// cliqMessagePayload is the JSON body sent to the Zoho bot message endpoint.
+// chat_id targets the reply to a specific user's conversation — without it
+// Zoho defaults to the bot owner's chat, causing all replies to land there
+// regardless of who sent the original message.
 type cliqMessagePayload struct {
-	Text string `json:"text"`
+	Text   string `json:"text"`
+	ChatID string `json:"chat_id,omitempty"`
 }
 
-// PostToChannel posts a text reply to Zoho Cliq via the bot webhook URL.
-func (s *Sender) PostToChannel(ctx context.Context, _ string, text string) error {
-	body, err := json.Marshal(cliqMessagePayload{Text: text})
+// PostToChannel posts a text reply to the given chat via the bot webhook URL.
+// chatID must be the Zoho chat ID (e.g. "CT_...") from the inbound webhook
+// payload — this ensures the reply reaches the correct user, not just the
+// bot owner.
+func (s *Sender) PostToChannel(ctx context.Context, chatID string, text string) error {
+	body, err := json.Marshal(cliqMessagePayload{Text: text, ChatID: chatID})
 	if err != nil {
 		return fmt.Errorf("marshal cliq message: %w", err)
 	}
@@ -95,7 +111,10 @@ func (s *Sender) PostToChannel(ctx context.Context, _ string, text string) error
 		return fmt.Errorf("cliq webhook status %d: %s", resp.StatusCode, string(raw))
 	}
 
-	slog.Info("zoho cliq reply sent via webhook", "status", resp.StatusCode)
+	slog.Info("zoho cliq reply sent via webhook",
+		"chat_id", chatID,
+		"status", resp.StatusCode,
+	)
 	return nil
 }
 
