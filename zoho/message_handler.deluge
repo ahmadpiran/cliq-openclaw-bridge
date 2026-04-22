@@ -56,6 +56,7 @@ if (msgText == "" && message != null && msgType == "text") {
 
 cleanText         = msgText.replaceAll("\\","\\\\").replaceAll("\"","\\\"").replaceAll("\n","\\n").replaceAll("\r","\\r");
 cleanSender       = user.get("first_name").toString().replaceAll("\"","\\\"");
+cleanSenderID     = user.get("id").toString();
 cleanChannel      = chat.get("id").toString();
 cleanChannelTitle = chat.get("title").toString().replaceAll("\"","\\\"");
 cleanAttachUrl    = attachUrl.replaceAll("\"","\\\"");
@@ -63,9 +64,9 @@ cleanAttachName   = attachName.replaceAll("\"","\\\"");
 cleanAttachMime   = attachMime.replaceAll("\"","\\\"");
 
 if (msgType == "file") {
-    payloadString = "{\"type\":\"message\",\"trigger\":{\"type\":\"incoming_message\"},\"message\":{\"sender\":\"" + cleanSender + "\",\"channel\":\"" + cleanChannel + "\",\"channel_title\":\"" + cleanChannelTitle + "\",\"text\":\"" + cleanText + "\",\"message_type\":\"file\",\"attachment_url\":\"" + cleanAttachUrl + "\",\"attachment_name\":\"" + cleanAttachName + "\",\"attachment_mime\":\"" + cleanAttachMime + "\"}}";
+    payloadString = "{\"type\":\"message\",\"trigger\":{\"type\":\"incoming_message\"},\"message\":{\"sender\":\"" + cleanSender + "\",\"sender_id\":\"" + cleanSenderID + "\",\"channel\":\"" + cleanChannel + "\",\"channel_title\":\"" + cleanChannelTitle + "\",\"text\":\"" + cleanText + "\",\"message_type\":\"file\",\"attachment_url\":\"" + cleanAttachUrl + "\",\"attachment_name\":\"" + cleanAttachName + "\",\"attachment_mime\":\"" + cleanAttachMime + "\"}}";
 } else {
-    payloadString = "{\"type\":\"message\",\"trigger\":{\"type\":\"incoming_message\"},\"message\":{\"sender\":\"" + cleanSender + "\",\"channel\":\"" + cleanChannel + "\",\"channel_title\":\"" + cleanChannelTitle + "\",\"text\":\"" + cleanText + "\",\"message_type\":\"text\"}}";
+    payloadString = "{\"type\":\"message\",\"trigger\":{\"type\":\"incoming_message\"},\"message\":{\"sender\":\"" + cleanSender + "\",\"sender_id\":\"" + cleanSenderID + "\",\"channel\":\"" + cleanChannel + "\",\"channel_title\":\"" + cleanChannelTitle + "\",\"text\":\"" + cleanText + "\",\"message_type\":\"text\"}}";
 }
 
 info "Payload bytes: " + payloadString.length();

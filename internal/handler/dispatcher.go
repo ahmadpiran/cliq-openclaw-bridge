@@ -24,8 +24,8 @@ type Forwarder interface {
 
 // ZohoSender is satisfied by *zoho.Sender.
 type ZohoSender interface {
-	PostToChannel(ctx context.Context, chatID, text string) error
-	SendFile(ctx context.Context, chatID, filePath string) error
+	PostToChannel(ctx context.Context, userID, text string) error
+	SendFile(ctx context.Context, userID, filePath string) error
 }
 
 type SessionReader interface {
@@ -38,6 +38,7 @@ type zohoMessagePayload struct {
 	Message struct {
 		Text           string `json:"text"`
 		Sender         string `json:"sender"`
+		SenderID       string `json:"sender_id"`
 		Channel        string `json:"channel"`
 		ChannelTitle   string `json:"channel_title"`
 		MessageType    string `json:"message_type"`
@@ -156,7 +157,7 @@ func (d *Dispatcher) forward(ctx context.Context, job worker.Job, p zohoMessageP
 		"session_key", sessionKey,
 	)
 
-	go d.postReply(job.RequestID, p.Message.Channel, sessionKey, dispatchTime)
+	go d.postReply(job.RequestID, p.Message.SenderID, sessionKey, dispatchTime)
 
 	return nil
 }
@@ -164,6 +165,7 @@ func (d *Dispatcher) forward(ctx context.Context, job worker.Job, p zohoMessageP
 func (d *Dispatcher) handleFile(ctx context.Context, job worker.Job, msg struct {
 	Text           string `json:"text"`
 	Sender         string `json:"sender"`
+	SenderID       string `json:"sender_id"`
 	Channel        string `json:"channel"`
 	ChannelTitle   string `json:"channel_title"`
 	MessageType    string `json:"message_type"`
@@ -211,17 +213,17 @@ func (d *Dispatcher) handleFile(ctx context.Context, job worker.Job, msg struct 
 		"session_key", sessionKey,
 	)
 
-	go d.postReply(job.RequestID, msg.Channel, sessionKey, dispatchTime)
+	go d.postReply(job.RequestID, msg.SenderID, sessionKey, dispatchTime)
 
 	return nil
 }
 
-func (d *Dispatcher) postReply(requestID, channel, sessionKey string, afterTime time.Time) {
-	if d.sender == nil || d.sessionReader == nil || channel == "" {
+func (d *Dispatcher) postReply(requestID, userID, sessionKey string, afterTime time.Time) {
+	if d.sender == nil || d.sessionReader == nil || userID == "" {
 		slog.Info("dispatcher: reply-back skipped",
 			"has_sender", d.sender != nil,
 			"has_reader", d.sessionReader != nil,
-			"channel", channel,
+			"user_id", userID,
 		)
 		return
 	}
@@ -287,7 +289,7 @@ found:
 			if reply == "" || reply == "NO_REPLY" {
 				continue
 			}
-			d.deliverReply(ctx, requestID, channel, reply)
+			d.deliverReply(ctx, requestID, userID, reply)
 		case <-ctx.Done():
 			slog.Info("dispatcher: reply timeout reached",
 				"request_id", requestID,
@@ -299,16 +301,16 @@ found:
 }
 
 // deliverReply sends text and/or a file from a single agent reply.
-func (d *Dispatcher) deliverReply(ctx context.Context, requestID, channel, reply string) {
+func (d *Dispatcher) deliverReply(ctx context.Context, requestID, userID, reply string) {
 	parsed := parseReply(reply, d.workspaceDir)
 
 	if parsed.text != "" {
 		slog.Info("dispatcher: agent replied, posting to zoho cliq",
 			"request_id", requestID,
-			"channel", channel,
+			"user_id", userID,
 			"reply_len", len(parsed.text),
 		)
-		if err := d.sender.PostToChannel(ctx, channel, parsed.text); err != nil {
+		if err := d.sender.PostToChannel(ctx, userID, parsed.text); err != nil {
 			slog.Error("dispatcher: failed to post text reply",
 				"request_id", requestID, "error", err)
 		}
@@ -317,10 +319,10 @@ func (d *Dispatcher) deliverReply(ctx context.Context, requestID, channel, reply
 	if parsed.filePath != "" {
 		slog.Info("dispatcher: sending file to zoho cliq",
 			"request_id", requestID,
-			"channel", channel,
+			"user_id", userID,
 			"file", parsed.filePath,
 		)
-		if err := d.sender.SendFile(ctx, channel, parsed.filePath); err != nil {
+		if err := d.sender.SendFile(ctx, userID, parsed.filePath); err != nil {
 			slog.Error("dispatcher: failed to send file",
 				"request_id", requestID,
 				"file", parsed.filePath,

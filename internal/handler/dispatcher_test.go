@@ -49,21 +49,21 @@ type fakeZohoSender struct {
 	fileErr      error
 	sent         atomic.Int32
 	filesSent    atomic.Int32
-	lastChannel  string
+	lastUserID   string
 	lastText     string
 	lastFilePath string
 }
 
-func (f *fakeZohoSender) PostToChannel(_ context.Context, channel, text string) error {
+func (f *fakeZohoSender) PostToChannel(_ context.Context, userID, text string) error {
 	f.sent.Add(1)
-	f.lastChannel = channel
+	f.lastUserID = userID
 	f.lastText = text
 	return f.err
 }
 
-func (f *fakeZohoSender) SendFile(_ context.Context, channel, filePath string) error {
+func (f *fakeZohoSender) SendFile(_ context.Context, userID, filePath string) error {
 	f.filesSent.Add(1)
-	f.lastChannel = channel
+	f.lastUserID = userID
 	f.lastFilePath = filePath
 	return f.fileErr
 }
@@ -241,6 +241,7 @@ func TestDispatcher_PostsReplyToZohoCliqAfterAgentResponds(t *testing.T) {
 		"message": map[string]any{
 			"text":          "hi",
 			"sender":        "Ross",
+			"sender_id":     "user_789",
 			"channel":       "CT_123",
 			"channel_title": "Test Channel",
 			"message_type":  "text",
@@ -259,8 +260,8 @@ func TestDispatcher_PostsReplyToZohoCliqAfterAgentResponds(t *testing.T) {
 	if sender.sent.Load() != 1 {
 		t.Errorf("expected 1 reply sent, got %d", sender.sent.Load())
 	}
-	if sender.lastChannel != "CT_123" {
-		t.Errorf("wrong channel: %s", sender.lastChannel)
+	if sender.lastUserID != "user_789" {
+		t.Errorf("wrong user ID: %s", sender.lastUserID)
 	}
 	if sender.lastText != "Hey Ross! 👋" {
 		t.Errorf("wrong reply text: %s", sender.lastText)
@@ -317,6 +318,7 @@ func TestDispatcher_SessionKeyPassedToSessionReader(t *testing.T) {
 		"message": map[string]any{
 			"text":         "hi",
 			"sender":       "Ross",
+			"sender_id":    "user_abc",
 			"channel":      "CT_xyz",
 			"message_type": "text",
 		},
@@ -349,14 +351,14 @@ func TestDispatcher_NoDuplicatesWhenTwoJobsRaceForSameSessionFile(t *testing.T) 
 	jobA := makeJob(t, map[string]any{
 		"type": "message",
 		"message": map[string]any{
-			"text": "first", "sender": "Ross",
+			"text": "first", "sender": "Ross", "sender_id": "user_123",
 			"channel": "CT_123", "message_type": "text",
 		},
 	})
 	jobB := makeJob(t, map[string]any{
 		"type": "message",
 		"message": map[string]any{
-			"text": "second", "sender": "Ross",
+			"text": "second", "sender": "Ross", "sender_id": "user_123",
 			"channel": "CT_123", "message_type": "text",
 		},
 	})
@@ -442,7 +444,7 @@ func TestDispatcher_ReplyBackSilentOnSenderFailure(t *testing.T) {
 	job := makeJob(t, map[string]any{
 		"type": "message",
 		"message": map[string]any{
-			"text": "hi", "sender": "Ross",
+			"text": "hi", "sender": "Ross", "sender_id": "user_abc",
 			"channel": "CT_123", "message_type": "text",
 		},
 	})
@@ -465,7 +467,7 @@ func TestDispatcher_SendsFileWhenReplyContainsFileTag(t *testing.T) {
 	job := makeJob(t, map[string]any{
 		"type": "message",
 		"message": map[string]any{
-			"text": "send me the file", "sender": "Ross",
+			"text": "send me the file", "sender": "Ross", "sender_id": "user_abc",
 			"channel": "CT_123", "message_type": "text",
 		},
 	})
@@ -487,5 +489,37 @@ func TestDispatcher_SendsFileWhenReplyContainsFileTag(t *testing.T) {
 	}
 	if sender.lastFilePath != "/data/workspace/uploads/report.pdf" {
 		t.Errorf("wrong file path: %q", sender.lastFilePath)
+	}
+}
+
+func TestDispatcher_UsesChannelForSessionKeyAndSenderIDForReply(t *testing.T) {
+	gw := &fakeForwarder{}
+	sender := &fakeZohoSender{}
+	reader := &fakeSessionReader{reply: "hello"}
+	d := newDispatcher(gw, &fakeTokenProvider{}, sender, reader)
+
+	job := makeJob(t, map[string]any{
+		"type": "message",
+		"message": map[string]any{
+			"text":         "hi",
+			"sender":       "Alice",
+			"sender_id":    "user_alice99",
+			"channel":      "CT_channel42",
+			"message_type": "text",
+		},
+	})
+
+	if err := d.Dispatch(context.Background(), job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	wantSessionKey := "hook:zoho-cliq:CT_channel42"
+	if gw.lastSessionKey != wantSessionKey {
+		t.Errorf("session key: got %q, want %q", gw.lastSessionKey, wantSessionKey)
+	}
+	if sender.lastUserID != "user_alice99" {
+		t.Errorf("reply user ID: got %q, want %q", sender.lastUserID, "user_alice99")
 	}
 }

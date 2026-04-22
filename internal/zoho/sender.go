@@ -76,20 +76,20 @@ func parseBotWebhookURL(rawURL string) (botName, zapiKey string) {
 }
 
 // cliqMessagePayload is the JSON body sent to the Zoho bot message endpoint.
-// chat_id targets the reply to a specific user's conversation — without it
+// userids targets the reply to a specific subscriber by their ZUID — without it
 // Zoho defaults to the bot owner's chat, causing all replies to land there
 // regardless of who sent the original message.
 type cliqMessagePayload struct {
-	Text   string `json:"text"`
-	ChatID string `json:"chat_id,omitempty"`
+	Text    string `json:"text"`
+	UserIDs string `json:"userids,omitempty"`
 }
 
-// PostToChannel posts a text reply to the given chat via the bot webhook URL.
-// chatID must be the Zoho chat ID (e.g. "CT_...") from the inbound webhook
-// payload — this ensures the reply reaches the correct user, not just the
-// bot owner.
-func (s *Sender) PostToChannel(ctx context.Context, chatID string, text string) error {
-	body, err := json.Marshal(cliqMessagePayload{Text: text, ChatID: chatID})
+// PostToChannel posts a text reply to the given user via the bot webhook URL.
+// userID must be the Zoho ZUID (e.g. "7xxxxx") from the inbound webhook
+// payload — this ensures the reply reaches the correct subscriber, not just
+// the bot owner.
+func (s *Sender) PostToChannel(ctx context.Context, userID string, text string) error {
+	body, err := json.Marshal(cliqMessagePayload{Text: text, UserIDs: userID})
 	if err != nil {
 		return fmt.Errorf("marshal cliq message: %w", err)
 	}
@@ -112,7 +112,7 @@ func (s *Sender) PostToChannel(ctx context.Context, chatID string, text string) 
 	}
 
 	slog.Info("zoho cliq reply sent via webhook",
-		"chat_id", chatID,
+		"user_id", userID,
 		"status", resp.StatusCode,
 	)
 	return nil
