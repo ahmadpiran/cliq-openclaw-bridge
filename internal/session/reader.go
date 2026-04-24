@@ -43,10 +43,21 @@ func NewReader(agentsDir, agentID string) *Reader {
 //     behaviour) in case OpenClaw uses opaque or timestamped filenames.
 func (r *Reader) FindLatestSessionFile(afterTime time.Time, sessionKey string) (string, error) {
 	pattern := filepath.Join(r.agentsDir, r.agentID, "sessions", "*.jsonl")
-	files, err := filepath.Glob(pattern)
+	all, err := filepath.Glob(pattern)
 	if err != nil {
 		return "", fmt.Errorf("glob session files: %w", err)
 	}
+
+	// Newer OpenClaw versions write <uuid>.trajectory.jsonl alongside the main
+	// session file. Exclude them — they use a different internal format and
+	// would shadow the correct session file when sorted by modification time.
+	var files []string
+	for _, f := range all {
+		if !strings.HasSuffix(f, ".trajectory.jsonl") {
+			files = append(files, f)
+		}
+	}
+
 	if len(files) == 0 {
 		return "", fmt.Errorf("no session files found in %s", pattern)
 	}
