@@ -16,23 +16,33 @@ import (
 // --- fakes ---
 
 type fakeForwarder struct {
-	forwardErr     error
-	forwardFileErr error
-	forwarded      atomic.Int32
-	fileForwarded  atomic.Int32
-	lastSessionKey string
+	result        *gateway.RespondResult
+	respondErr    error
+	fileErr       error
+	responded     atomic.Int32
+	fileResponded atomic.Int32
 }
 
-func (f *fakeForwarder) Forward(_ context.Context, req gateway.ForwardRequest) error {
-	f.forwarded.Add(1)
-	f.lastSessionKey = req.SessionKey
-	return f.forwardErr
+func (f *fakeForwarder) Respond(_ context.Context, _ gateway.RespondRequest) (*gateway.RespondResult, error) {
+	f.responded.Add(1)
+	if f.respondErr != nil {
+		return nil, f.respondErr
+	}
+	if f.result != nil {
+		return f.result, nil
+	}
+	return &gateway.RespondResult{ResponseID: "resp_test"}, nil
 }
 
-func (f *fakeForwarder) DownloadAndForward(_ context.Context, _, _, _, _, _, sessionKey, _ string) error {
-	f.fileForwarded.Add(1)
-	f.lastSessionKey = sessionKey
-	return f.forwardFileErr
+func (f *fakeForwarder) DownloadAndRespond(_ context.Context, _, _, _, _, _, _, _ string) (*gateway.RespondResult, error) {
+	f.fileResponded.Add(1)
+	if f.fileErr != nil {
+		return nil, f.fileErr
+	}
+	if f.result != nil {
+		return f.result, nil
+	}
+	return &gateway.RespondResult{ResponseID: "resp_file"}, nil
 }
 
 type fakeTokenProvider struct {
@@ -68,71 +78,14 @@ func (f *fakeZohoSender) SendFile(_ context.Context, userID, filePath string) er
 	return f.fileErr
 }
 
-type fakeSessionReader struct {
-	reply          string
-	replyErr       error
-	fileErr        error
-	calls          atomic.Int32
-	lastSessionKey string
-}
-
-func (f *fakeSessionReader) FindLatestSessionFile(_ time.Time, sessionKey string) (string, error) {
-	f.lastSessionKey = sessionKey
-	return "fake.jsonl", f.fileErr
-}
-
-func (f *fakeSessionReader) TailAssistantMessages(
-	ctx context.Context, _ string, _ time.Time, out chan<- string,
-) {
-	f.calls.Add(1)
-	if f.replyErr != nil || f.reply == "" {
-		return
-	}
-	select {
-	case out <- f.reply:
-	case <-ctx.Done():
-	}
-}
-
-// blockingSessionReader returns the same file but blocks until released,
-// used to hold a claim open while testing the exclusion behaviour.
-type blockingSessionReader struct {
-	file    string
-	fileErr error
-	reply   string
-	release chan struct{}
-	calls   atomic.Int32
-}
-
-func (b *blockingSessionReader) FindLatestSessionFile(_ time.Time, _ string) (string, error) {
-	return b.file, b.fileErr
-}
-
-func (b *blockingSessionReader) TailAssistantMessages(
-	ctx context.Context, _ string, _ time.Time, out chan<- string,
-) {
-	b.calls.Add(1)
-	select {
-	case <-b.release:
-		if b.reply != "" {
-			select {
-			case out <- b.reply:
-			case <-ctx.Done():
-			}
-		}
-	case <-ctx.Done():
-	}
-}
-
 // --- helpers ---
 
 func newDispatcher(
 	gw handler.Forwarder,
 	tp handler.TokenProvider,
 	sender handler.ZohoSender,
-	reader handler.SessionReader,
 ) *handler.Dispatcher {
-	return handler.NewDispatcher(gw, tp, sender, reader, "", 5*time.Second)
+	return handler.NewDispatcher(gw, tp, sender, "", 5*time.Second)
 }
 
 func makeJob(t *testing.T, payload any) worker.Job {
@@ -148,7 +101,7 @@ func makeJob(t *testing.T, payload any) worker.Job {
 
 func TestDispatcher_ForwardsPlainPayload(t *testing.T) {
 	gw := &fakeForwarder{}
-	d := newDispatcher(gw, &fakeTokenProvider{}, nil, nil)
+	d := newDispatcher(gw, &fakeTokenProvider{}, nil)
 
 	job := makeJob(t, map[string]any{
 		"type": "message",
@@ -160,31 +113,31 @@ func TestDispatcher_ForwardsPlainPayload(t *testing.T) {
 	if err := d.Dispatch(context.Background(), job); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if gw.forwarded.Load() != 1 {
-		t.Errorf("expected 1 forward call, got %d", gw.forwarded.Load())
+	if gw.responded.Load() != 1 {
+		t.Errorf("expected 1 Respond call, got %d", gw.responded.Load())
 	}
-	if gw.fileForwarded.Load() != 0 {
-		t.Error("DownloadAndForward must not be called for plain text")
+	if gw.fileResponded.Load() != 0 {
+		t.Error("DownloadAndRespond must not be called for plain text")
 	}
 }
 
 func TestDispatcher_ForwardsRawWhenPayloadNotJSON(t *testing.T) {
 	gw := &fakeForwarder{}
-	d := newDispatcher(gw, &fakeTokenProvider{}, nil, nil)
+	d := newDispatcher(gw, &fakeTokenProvider{}, nil)
 
 	job := worker.Job{RequestID: "req-raw", Payload: []byte(`NOT_JSON`), ReceivedAt: time.Now()}
 	if err := d.Dispatch(context.Background(), job); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if gw.forwarded.Load() != 1 {
-		t.Errorf("expected raw payload to be forwarded, got %d", gw.forwarded.Load())
+	if gw.responded.Load() != 1 {
+		t.Errorf("expected raw payload to be responded to, got %d", gw.responded.Load())
 	}
 }
 
-func TestDispatcher_DownloadsAndForwardsFileAttachment(t *testing.T) {
+func TestDispatcher_DownloadsAndRespondsForFileAttachment(t *testing.T) {
 	gw := &fakeForwarder{}
 	tp := &fakeTokenProvider{token: "zoho-tok-123"}
-	d := handler.NewDispatcher(gw, tp, nil, nil, "/tmp/workspace", 5*time.Second)
+	d := handler.NewDispatcher(gw, tp, nil, "/tmp/workspace", 5*time.Second)
 
 	job := makeJob(t, map[string]any{
 		"type": "message",
@@ -202,18 +155,18 @@ func TestDispatcher_DownloadsAndForwardsFileAttachment(t *testing.T) {
 	if err := d.Dispatch(context.Background(), job); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if gw.fileForwarded.Load() != 1 {
-		t.Errorf("expected 1 DownloadAndForward call, got %d", gw.fileForwarded.Load())
+	if gw.fileResponded.Load() != 1 {
+		t.Errorf("expected 1 DownloadAndRespond call, got %d", gw.fileResponded.Load())
 	}
-	if gw.forwarded.Load() != 0 {
-		t.Error("Forward must not be called directly for file attachments")
+	if gw.responded.Load() != 0 {
+		t.Error("Respond must not be called directly for file attachments")
 	}
 }
 
 func TestDispatcher_ErrorWhenTokenProviderFails(t *testing.T) {
 	gw := &fakeForwarder{}
 	tp := &fakeTokenProvider{err: errors.New("bolt read error")}
-	d := handler.NewDispatcher(gw, tp, nil, nil, "/tmp/workspace", 5*time.Second)
+	d := handler.NewDispatcher(gw, tp, nil, "/tmp/workspace", 5*time.Second)
 
 	job := makeJob(t, map[string]any{
 		"type": "message",
@@ -231,10 +184,9 @@ func TestDispatcher_ErrorWhenTokenProviderFails(t *testing.T) {
 }
 
 func TestDispatcher_PostsReplyToZohoCliqAfterAgentResponds(t *testing.T) {
-	gw := &fakeForwarder{}
+	gw := &fakeForwarder{result: &gateway.RespondResult{ResponseID: "resp_1", Text: "Hey Ross! 👋"}}
 	sender := &fakeZohoSender{}
-	reader := &fakeSessionReader{reply: "Hey Ross! 👋"}
-	d := newDispatcher(gw, &fakeTokenProvider{}, sender, reader)
+	d := newDispatcher(gw, &fakeTokenProvider{}, sender)
 
 	job := makeJob(t, map[string]any{
 		"type": "message",
@@ -252,11 +204,6 @@ func TestDispatcher_PostsReplyToZohoCliqAfterAgentResponds(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	time.Sleep(300 * time.Millisecond)
-
-	if gw.forwarded.Load() != 1 {
-		t.Errorf("expected 1 forward call, got %d", gw.forwarded.Load())
-	}
 	if sender.sent.Load() != 1 {
 		t.Errorf("expected 1 reply sent, got %d", sender.sent.Load())
 	}
@@ -268,162 +215,52 @@ func TestDispatcher_PostsReplyToZohoCliqAfterAgentResponds(t *testing.T) {
 	}
 }
 
-func TestDispatcher_SessionKeyIsPerChannel(t *testing.T) {
-	gw := &fakeForwarder{}
-	d := newDispatcher(gw, &fakeTokenProvider{}, nil, nil)
+func TestDispatcher_ThreadContinuityAcrossMessages(t *testing.T) {
+	calls := make(chan trackCall, 4)
 
-	job := makeJob(t, map[string]any{
-		"type": "message",
-		"message": map[string]any{
-			"text":         "hello",
-			"sender":       "Ross",
-			"channel":      "CT_abc999",
-			"message_type": "text",
-		},
-	})
-
-	if err := d.Dispatch(context.Background(), job); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	trackingGW := &trackingForwarder{calls: calls}
+	trackingGW.responses = []gateway.RespondResult{
+		{ResponseID: "resp_first", Text: "first reply"},
+		{ResponseID: "resp_second", Text: "second reply"},
 	}
 
-	want := "hook:zoho-cliq:CT_abc999"
-	if gw.lastSessionKey != want {
-		t.Errorf("expected session key %q, got %q", want, gw.lastSessionKey)
-	}
-}
-
-func TestDispatcher_SessionKeyFallsBackWhenChannelEmpty(t *testing.T) {
-	gw := &fakeForwarder{}
-	d := newDispatcher(gw, &fakeTokenProvider{}, nil, nil)
-
-	job := worker.Job{RequestID: "req-raw", Payload: []byte(`NOT_JSON`), ReceivedAt: time.Now()}
-	if err := d.Dispatch(context.Background(), job); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	want := "hook:zoho-cliq"
-	if gw.lastSessionKey != want {
-		t.Errorf("expected fallback session key %q, got %q", want, gw.lastSessionKey)
-	}
-}
-
-func TestDispatcher_SessionKeyPassedToSessionReader(t *testing.T) {
-	gw := &fakeForwarder{}
 	sender := &fakeZohoSender{}
-	reader := &fakeSessionReader{reply: "ok"}
-	d := newDispatcher(gw, &fakeTokenProvider{}, sender, reader)
+	d := handler.NewDispatcher(trackingGW, &fakeTokenProvider{}, sender, "", 5*time.Second)
 
-	job := makeJob(t, map[string]any{
-		"type": "message",
-		"message": map[string]any{
-			"text":         "hi",
-			"sender":       "Ross",
-			"sender_id":    "user_abc",
-			"channel":      "CT_xyz",
-			"message_type": "text",
-		},
-	})
-
-	if err := d.Dispatch(context.Background(), job); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	makeMsg := func(text string) worker.Job {
+		return makeJob(t, map[string]any{
+			"type": "message",
+			"message": map[string]any{
+				"text":         text,
+				"sender":       "Ross",
+				"sender_id":    "user_789",
+				"channel":      "CT_123",
+				"message_type": "text",
+			},
+		})
 	}
 
-	time.Sleep(300 * time.Millisecond)
-
-	want := "hook:zoho-cliq:CT_xyz"
-	if reader.lastSessionKey != want {
-		t.Errorf("expected session reader to receive key %q, got %q", want, reader.lastSessionKey)
+	if err := d.Dispatch(context.Background(), makeMsg("first")); err != nil {
+		t.Fatalf("first dispatch error: %v", err)
 	}
+	call1 := <-calls
+	if call1.prevResponseID != "" {
+		t.Errorf("first message should have no prevResponseID, got %q", call1.prevResponseID)
+	}
+
+	if err := d.Dispatch(context.Background(), makeMsg("second")); err != nil {
+		t.Fatalf("second dispatch error: %v", err)
+	}
+	call2 := <-calls
+	if call2.prevResponseID != "resp_first" {
+		t.Errorf("second message should use prev response ID %q, got %q", "resp_first", call2.prevResponseID)
+	}
+
 }
 
-func TestDispatcher_NoDuplicatesWhenTwoJobsRaceForSameSessionFile(t *testing.T) {
-	gw := &fakeForwarder{}
-	sender := &fakeZohoSender{}
-	release := make(chan struct{})
-	reader := &blockingSessionReader{
-		file:    "shared.jsonl",
-		reply:   "single reply",
-		release: release,
-	}
-
-	d := handler.NewDispatcher(gw, &fakeTokenProvider{}, sender, reader, "", 3*time.Second)
-
-	jobA := makeJob(t, map[string]any{
-		"type": "message",
-		"message": map[string]any{
-			"text": "first", "sender": "Ross", "sender_id": "user_123",
-			"channel": "CT_123", "message_type": "text",
-		},
-	})
-	jobB := makeJob(t, map[string]any{
-		"type": "message",
-		"message": map[string]any{
-			"text": "second", "sender": "Ross", "sender_id": "user_123",
-			"channel": "CT_123", "message_type": "text",
-		},
-	})
-
-	_ = d.Dispatch(context.Background(), jobA)
-	time.Sleep(100 * time.Millisecond)
-	_ = d.Dispatch(context.Background(), jobB)
-	time.Sleep(100 * time.Millisecond)
-
-	close(release)
-	time.Sleep(300 * time.Millisecond)
-
-	if n := sender.sent.Load(); n != 1 {
-		t.Errorf("expected exactly 1 reply sent, got %d (duplicate suppression failed)", n)
-	}
-}
-
-func TestDispatcher_NoReplyWhenSenderIsNil(t *testing.T) {
-	gw := &fakeForwarder{}
-	reader := &fakeSessionReader{reply: "some reply"}
-	d := newDispatcher(gw, &fakeTokenProvider{}, nil, reader)
-
-	job := makeJob(t, map[string]any{
-		"type": "message",
-		"message": map[string]any{
-			"text": "hi", "sender": "Ross",
-			"channel": "CT_123", "message_type": "text",
-		},
-	})
-
-	if err := d.Dispatch(context.Background(), job); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	time.Sleep(100 * time.Millisecond)
-	if reader.calls.Load() != 0 {
-		t.Error("session reader must not be called when sender is nil")
-	}
-}
-
-func TestDispatcher_NoReplyWhenChannelIsEmpty(t *testing.T) {
-	gw := &fakeForwarder{}
-	sender := &fakeZohoSender{}
-	reader := &fakeSessionReader{reply: "some reply"}
-	d := newDispatcher(gw, &fakeTokenProvider{}, sender, reader)
-
-	job := makeJob(t, map[string]any{
-		"type": "message",
-		"message": map[string]any{
-			"text": "hi", "sender": "Ross",
-			"message_type": "text",
-		},
-	})
-
-	if err := d.Dispatch(context.Background(), job); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	time.Sleep(100 * time.Millisecond)
-	if sender.sent.Load() != 0 {
-		t.Error("reply must not be sent when channel is empty")
-	}
-}
-
-func TestDispatcher_ForwardErrorPropagates(t *testing.T) {
-	gw := &fakeForwarder{forwardErr: errors.New("openclaw down")}
-	d := newDispatcher(gw, &fakeTokenProvider{}, nil, nil)
+func TestDispatcher_RespondErrorPropagates(t *testing.T) {
+	gw := &fakeForwarder{respondErr: errors.New("openclaw down")}
+	d := newDispatcher(gw, &fakeTokenProvider{}, nil)
 
 	job := makeJob(t, map[string]any{
 		"type":    "message",
@@ -431,15 +268,14 @@ func TestDispatcher_ForwardErrorPropagates(t *testing.T) {
 	})
 
 	if err := d.Dispatch(context.Background(), job); err == nil {
-		t.Fatal("expected error when forward fails, got nil")
+		t.Fatal("expected error when respond fails, got nil")
 	}
 }
 
 func TestDispatcher_ReplyBackSilentOnSenderFailure(t *testing.T) {
-	gw := &fakeForwarder{}
+	gw := &fakeForwarder{result: &gateway.RespondResult{ResponseID: "resp_1", Text: "Hey!"}}
 	sender := &fakeZohoSender{err: errors.New("zoho api down")}
-	reader := &fakeSessionReader{reply: "Hey!"}
-	d := newDispatcher(gw, &fakeTokenProvider{}, sender, reader)
+	d := newDispatcher(gw, &fakeTokenProvider{}, sender)
 
 	job := makeJob(t, map[string]any{
 		"type": "message",
@@ -452,17 +288,18 @@ func TestDispatcher_ReplyBackSilentOnSenderFailure(t *testing.T) {
 	if err := d.Dispatch(context.Background(), job); err != nil {
 		t.Fatalf("sender failure should not fail the job, got: %v", err)
 	}
-	time.Sleep(300 * time.Millisecond)
 	if sender.sent.Load() != 1 {
 		t.Error("sender must have been called even though it errored")
 	}
 }
 
 func TestDispatcher_SendsFileWhenReplyContainsFileTag(t *testing.T) {
-	gw := &fakeForwarder{}
+	gw := &fakeForwarder{result: &gateway.RespondResult{
+		ResponseID: "resp_1",
+		Text:       "Here is your report.\n[FILE:~/workspace/uploads/report.pdf]",
+	}}
 	sender := &fakeZohoSender{}
-	reader := &fakeSessionReader{reply: "Here is your report.\n[FILE:~/workspace/uploads/report.pdf]"}
-	d := handler.NewDispatcher(gw, &fakeTokenProvider{}, sender, reader, "/data/workspace", 5*time.Second)
+	d := handler.NewDispatcher(gw, &fakeTokenProvider{}, sender, "/data/workspace", 5*time.Second)
 
 	job := makeJob(t, map[string]any{
 		"type": "message",
@@ -475,8 +312,6 @@ func TestDispatcher_SendsFileWhenReplyContainsFileTag(t *testing.T) {
 	if err := d.Dispatch(context.Background(), job); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
-	time.Sleep(300 * time.Millisecond)
 
 	if sender.sent.Load() != 1 {
 		t.Errorf("expected 1 text post, got %d", sender.sent.Load())
@@ -492,11 +327,54 @@ func TestDispatcher_SendsFileWhenReplyContainsFileTag(t *testing.T) {
 	}
 }
 
-func TestDispatcher_UsesChannelForSessionKeyAndSenderIDForReply(t *testing.T) {
-	gw := &fakeForwarder{}
+func TestDispatcher_NoReplyWhenSenderIsNil(t *testing.T) {
+	gw := &fakeForwarder{result: &gateway.RespondResult{ResponseID: "resp_1", Text: "some reply"}}
+	d := newDispatcher(gw, &fakeTokenProvider{}, nil)
+
+	job := makeJob(t, map[string]any{
+		"type": "message",
+		"message": map[string]any{
+			"text": "hi", "sender": "Ross",
+			"channel": "CT_123", "message_type": "text",
+		},
+	})
+
+	if err := d.Dispatch(context.Background(), job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// no assertions — just verify no panic when sender is nil
+}
+
+func TestDispatcher_NoReplyWhenSenderIDIsEmpty(t *testing.T) {
+	gw := &fakeForwarder{result: &gateway.RespondResult{ResponseID: "resp_1", Text: "some reply"}}
 	sender := &fakeZohoSender{}
-	reader := &fakeSessionReader{reply: "hello"}
-	d := newDispatcher(gw, &fakeTokenProvider{}, sender, reader)
+	d := newDispatcher(gw, &fakeTokenProvider{}, sender)
+
+	job := makeJob(t, map[string]any{
+		"type": "message",
+		"message": map[string]any{
+			"text": "hi", "sender": "Ross",
+			"message_type": "text",
+			// no sender_id
+		},
+	})
+
+	if err := d.Dispatch(context.Background(), job); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if sender.sent.Load() != 0 {
+		t.Error("reply must not be sent when sender_id is empty")
+	}
+}
+
+func TestDispatcher_UsesChannelForThreadAndSenderIDForReply(t *testing.T) {
+	calls := make(chan gateway.RespondRequest, 4)
+	gw := &capturingForwarder{
+		calls: calls,
+		result: &gateway.RespondResult{ResponseID: "resp_1", Text: "hello"},
+	}
+	sender := &fakeZohoSender{}
+	d := newDispatcher(gw, &fakeTokenProvider{}, sender)
 
 	job := makeJob(t, map[string]any{
 		"type": "message",
@@ -513,13 +391,57 @@ func TestDispatcher_UsesChannelForSessionKeyAndSenderIDForReply(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	time.Sleep(300 * time.Millisecond)
+	req := <-calls
+	_ = req // channel tracking is in channelResponseIDs, not session key
 
-	wantSessionKey := "hook:zoho-cliq:CT_channel42"
-	if gw.lastSessionKey != wantSessionKey {
-		t.Errorf("session key: got %q, want %q", gw.lastSessionKey, wantSessionKey)
-	}
 	if sender.lastUserID != "user_alice99" {
 		t.Errorf("reply user ID: got %q, want %q", sender.lastUserID, "user_alice99")
 	}
 }
+
+// --- tracking fakes for thread continuity test ---
+
+type trackCall struct {
+	prevResponseID string
+	responseID     string
+}
+
+type trackingForwarder struct {
+	responses []gateway.RespondResult
+	idx       int
+	calls     chan<- trackCall
+}
+
+func (t *trackingForwarder) Respond(_ context.Context, req gateway.RespondRequest) (*gateway.RespondResult, error) {
+	var result gateway.RespondResult
+	if t.idx < len(t.responses) {
+		result = t.responses[t.idx]
+		t.idx++
+	}
+	t.calls <- trackCall{req.PrevResponseID, result.ResponseID}
+	return &result, nil
+}
+
+func (t *trackingForwarder) DownloadAndRespond(_ context.Context, _, _, _, _, _, _, _ string) (*gateway.RespondResult, error) {
+	return &gateway.RespondResult{}, nil
+}
+
+type capturingForwarder struct {
+	calls  chan<- gateway.RespondRequest
+	result *gateway.RespondResult
+}
+
+func (c *capturingForwarder) Respond(_ context.Context, req gateway.RespondRequest) (*gateway.RespondResult, error) {
+	c.calls <- req
+	if c.result != nil {
+		return c.result, nil
+	}
+	return &gateway.RespondResult{}, nil
+}
+
+func (c *capturingForwarder) DownloadAndRespond(_ context.Context, _, _, _, _, _, _, _ string) (*gateway.RespondResult, error) {
+	return &gateway.RespondResult{}, nil
+}
+
+// Ensure time import is used
+var _ = time.Second

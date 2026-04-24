@@ -17,20 +17,18 @@ type TokenProvider interface {
 	ValidToken(ctx context.Context) (string, error)
 }
 
+// Forwarder is implemented by *gateway.Client.
+// Respond sends a message via the /v1/responses API and returns the reply plus
+// a response ID that must be threaded into the next call for this channel.
 type Forwarder interface {
-	Forward(ctx context.Context, req gateway.ForwardRequest) error
-	DownloadAndForward(ctx context.Context, srcURL, filename, mimeType, zohoToken, comment, sessionKey, workspaceDir string) error
+	Respond(ctx context.Context, req gateway.RespondRequest) (*gateway.RespondResult, error)
+	DownloadAndRespond(ctx context.Context, srcURL, filename, mimeType, zohoToken, comment, prevResponseID, workspaceDir string) (*gateway.RespondResult, error)
 }
 
 // ZohoSender is satisfied by *zoho.Sender.
 type ZohoSender interface {
 	PostToChannel(ctx context.Context, userID, text string) error
 	SendFile(ctx context.Context, userID, filePath string) error
-}
-
-type SessionReader interface {
-	FindLatestSessionFile(afterTime time.Time, sessionKey string) (string, error)
-	TailAssistantMessages(ctx context.Context, sessionFile string, afterTime time.Time, out chan<- string)
 }
 
 type zohoMessagePayload struct {
@@ -81,38 +79,28 @@ func parseReply(reply, workspaceDir string) parsedReply {
 	return parsedReply{text: text, filePath: resolved}
 }
 
-func sessionKeyForChannel(channelID string) string {
-	if channelID == "" {
-		return "hook:zoho-cliq"
-	}
-	return "hook:zoho-cliq:" + channelID
-}
-
 type Dispatcher struct {
-	gw              Forwarder
-	refresher       TokenProvider
-	sender          ZohoSender
-	sessionReader   SessionReader
-	workspaceDir    string
-	replyTimeout    time.Duration
-	claimedSessions sync.Map
+	gw                 Forwarder
+	refresher          TokenProvider
+	sender             ZohoSender
+	workspaceDir       string
+	replyTimeout       time.Duration
+	channelResponseIDs sync.Map // channelID string → last response ID string
 }
 
 func NewDispatcher(
 	gw Forwarder,
 	refresher TokenProvider,
 	sender ZohoSender,
-	sessionReader SessionReader,
 	workspaceDir string,
 	replyTimeout time.Duration,
 ) *Dispatcher {
 	return &Dispatcher{
-		gw:            gw,
-		refresher:     refresher,
-		sender:        sender,
-		sessionReader: sessionReader,
-		workspaceDir:  workspaceDir,
-		replyTimeout:  replyTimeout,
+		gw:           gw,
+		refresher:    refresher,
+		sender:       sender,
+		workspaceDir: workspaceDir,
+		replyTimeout: replyTimeout,
 	}
 }
 
@@ -131,38 +119,47 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job worker.Job) error {
 	return d.forward(ctx, job, p)
 }
 
+func (d *Dispatcher) prevResponseID(channelID string) string {
+	if v, ok := d.channelResponseIDs.Load(channelID); ok {
+		return v.(string)
+	}
+	return ""
+}
+
 func (d *Dispatcher) forward(ctx context.Context, job worker.Job, p zohoMessagePayload) error {
-	sessionKey := sessionKeyForChannel(p.Message.Channel)
+	channelID := p.Message.Channel
 
 	message := string(job.Payload)
 	if p.Message.Text != "" {
-		userMsg := fmt.Sprintf("[Zoho Cliq] %s wrote in #%s: %s",
+		message = fmt.Sprintf("[Zoho Cliq] %s wrote in #%s: %s",
 			p.Message.Sender, p.Message.ChannelTitle, p.Message.Text)
-		if d.sessionReader != nil {
-			message = "[Session note: new context window — silently read ~/workspace/memory/ to restore prior conversation context before responding]\n" + userMsg
-		} else {
-			message = userMsg
-		}
 	}
 
-	dispatchTime := time.Now()
+	prevID := d.prevResponseID(channelID)
 
-	if err := d.gw.Forward(ctx, gateway.ForwardRequest{
-		Message:    message,
-		Name:       "Zoho Cliq",
-		SessionKey: sessionKey,
-		RequestID:  job.RequestID,
-		ReceivedAt: job.ReceivedAt,
-	}); err != nil {
-		return fmt.Errorf("forward to openclaw: %w", err)
+	result, err := d.gw.Respond(ctx, gateway.RespondRequest{
+		Input:          message,
+		PrevResponseID: prevID,
+		RequestID:      job.RequestID,
+		ReceivedAt:     job.ReceivedAt,
+	})
+	if err != nil {
+		return fmt.Errorf("openclaw respond: %w", err)
 	}
 
-	slog.Info("dispatcher: job forwarded to openclaw",
+	if result.ResponseID != "" {
+		d.channelResponseIDs.Store(channelID, result.ResponseID)
+	}
+
+	slog.Info("dispatcher: openclaw responded",
 		"request_id", job.RequestID,
-		"session_key", sessionKey,
+		"response_id", result.ResponseID,
+		"continued_thread", prevID != "",
 	)
 
-	go d.postReply(job.RequestID, p.Message.SenderID, sessionKey, dispatchTime)
+	if result.Text != "" && d.sender != nil && p.Message.SenderID != "" {
+		d.deliverReply(ctx, job.RequestID, p.Message.SenderID, result.Text)
+	}
 
 	return nil
 }
@@ -189,120 +186,43 @@ func (d *Dispatcher) handleFile(ctx context.Context, job worker.Job, msg struct 
 		return fmt.Errorf("get zoho token for file download: %w", err)
 	}
 
-	sessionKey := sessionKeyForChannel(msg.Channel)
+	prevID := d.prevResponseID(msg.Channel)
 
 	slog.Info("dispatcher: downloading and forwarding file",
 		"request_id", job.RequestID,
 		"filename", msg.AttachmentName,
 		"mime_type", msg.AttachmentMime,
-		"session_key", sessionKey,
+		"continued_thread", prevID != "",
 	)
 
-	dispatchTime := time.Now()
-
-	if err := d.gw.DownloadAndForward(
+	result, err := d.gw.DownloadAndRespond(
 		ctx,
 		msg.AttachmentURL,
 		msg.AttachmentName,
 		msg.AttachmentMime,
 		token,
 		msg.Text,
-		sessionKey,
+		prevID,
 		d.workspaceDir,
-	); err != nil {
-		return fmt.Errorf("download and forward: %w", err)
+	)
+	if err != nil {
+		return fmt.Errorf("download and respond: %w", err)
 	}
 
-	slog.Info("dispatcher: file forwarded to openclaw",
+	if result.ResponseID != "" {
+		d.channelResponseIDs.Store(msg.Channel, result.ResponseID)
+	}
+
+	slog.Info("dispatcher: openclaw responded to file",
 		"request_id", job.RequestID,
-		"session_key", sessionKey,
+		"response_id", result.ResponseID,
 	)
 
-	go d.postReply(job.RequestID, msg.SenderID, sessionKey, dispatchTime)
+	if result.Text != "" && d.sender != nil && msg.SenderID != "" {
+		d.deliverReply(ctx, job.RequestID, msg.SenderID, result.Text)
+	}
 
 	return nil
-}
-
-func (d *Dispatcher) postReply(requestID, userID, sessionKey string, afterTime time.Time) {
-	if d.sender == nil || d.sessionReader == nil || userID == "" {
-		slog.Info("dispatcher: reply-back skipped",
-			"has_sender", d.sender != nil,
-			"has_reader", d.sessionReader != nil,
-			"user_id", userID,
-		)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), d.replyTimeout)
-	defer cancel()
-
-	fileTicker := time.NewTicker(1 * time.Second)
-	defer fileTicker.Stop()
-
-	tryClaimFile := func() string {
-		f, err := d.sessionReader.FindLatestSessionFile(afterTime, sessionKey)
-		if err != nil {
-			return ""
-		}
-		if _, alreadyClaimed := d.claimedSessions.LoadOrStore(f, struct{}{}); alreadyClaimed {
-			return ""
-		}
-		return f
-	}
-
-	var sessionFile string
-
-	if f := tryClaimFile(); f != "" {
-		sessionFile = f
-		goto found
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			slog.Warn("dispatcher: timed out waiting for unclaimed session file",
-				"request_id", requestID,
-				"session_key", sessionKey,
-			)
-			return
-		case <-fileTicker.C:
-			if f := tryClaimFile(); f != "" {
-				sessionFile = f
-				goto found
-			}
-		}
-	}
-
-found:
-	defer d.claimedSessions.Delete(sessionFile)
-
-	slog.Info("dispatcher: found session file, tailing for replies",
-		"request_id", requestID,
-		"session_key", sessionKey,
-		"file", sessionFile,
-	)
-
-	out := make(chan string, 8)
-	go d.sessionReader.TailAssistantMessages(ctx, sessionFile, afterTime, out)
-
-	for {
-		select {
-		case reply, ok := <-out:
-			if !ok {
-				return
-			}
-			if reply == "" || reply == "NO_REPLY" {
-				continue
-			}
-			d.deliverReply(ctx, requestID, userID, reply)
-		case <-ctx.Done():
-			slog.Info("dispatcher: reply timeout reached",
-				"request_id", requestID,
-				"session_key", sessionKey,
-			)
-			return
-		}
-	}
 }
 
 // deliverReply sends text and/or a file from a single agent reply.
@@ -338,12 +258,20 @@ func (d *Dispatcher) deliverReply(ctx context.Context, requestID, userID, reply 
 }
 
 func (d *Dispatcher) forwardRaw(ctx context.Context, job worker.Job) error {
-	// Channel is unknown for unparseable payloads; fall back to the shared key.
-	return d.gw.Forward(ctx, gateway.ForwardRequest{
-		Message:    string(job.Payload),
-		Name:       "Zoho Cliq",
-		SessionKey: sessionKeyForChannel(""),
+	// Channel unknown — start a new thread with no continuity.
+	result, err := d.gw.Respond(ctx, gateway.RespondRequest{
+		Input:      string(job.Payload),
 		RequestID:  job.RequestID,
 		ReceivedAt: job.ReceivedAt,
 	})
+	if err != nil {
+		return fmt.Errorf("respond (raw): %w", err)
+	}
+	if result.Text != "" {
+		slog.Info("dispatcher: raw payload got response (no user to deliver to)",
+			"request_id", job.RequestID,
+			"response_id", result.ResponseID,
+		)
+	}
+	return nil
 }

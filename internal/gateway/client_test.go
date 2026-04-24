@@ -203,7 +203,7 @@ func TestForward_SessionKeyOmittedWhenEmpty(t *testing.T) {
 	}
 }
 
-func TestDownloadAndForward_SavesFileAndForwards(t *testing.T) {
+func TestDownloadAndRespond_SavesFileAndSendsMessage(t *testing.T) {
 	const fileContent = "hello from zoho file attachment"
 
 	// Simulate Zoho file download endpoint.
@@ -213,32 +213,33 @@ func TestDownloadAndForward_SavesFileAndForwards(t *testing.T) {
 	}))
 	defer zohoSrv.Close()
 
-	// Simulate OpenClaw /hooks/agent endpoint.
-	var receivedMessage string
+	// Simulate OpenClaw /v1/responses endpoint.
+	var receivedInput string
 	openclawSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		json.NewDecoder(r.Body).Decode(&body)
-		receivedMessage, _ = body["message"].(string)
+		receivedInput, _ = body["input"].(string)
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"ok":true,"runId":"test-run"}`))
+		w.Write([]byte(`{"id":"resp_test","output":[{"type":"message","content":[{"type":"output_text","text":"got it"}]}]}`))
 	}))
 	defer openclawSrv.Close()
 
 	workspaceDir := t.TempDir()
 	client := newTestClient(t, openclawSrv.URL)
 
-	err := client.DownloadAndForward(
+	result, err := client.DownloadAndRespond(
 		context.Background(),
 		zohoSrv.URL+"/file/123",
 		"report.txt",
 		"text/plain",
-		"",               // zohoToken
-		"please review",  // comment
-		"hook:zoho-cliq", // sessionKey
+		"",              // zohoToken
+		"please review", // comment
+		"",              // prevResponseID (first message)
 		workspaceDir,
 	)
 	if err != nil {
-		t.Fatalf("DownloadAndForward error: %v", err)
+		t.Fatalf("DownloadAndRespond error: %v", err)
 	}
 
 	// Confirm the file was written to the workspace.
@@ -252,10 +253,14 @@ func TestDownloadAndForward_SavesFileAndForwards(t *testing.T) {
 	}
 
 	// Confirm the agent received a message referencing the file path.
-	if !strings.Contains(receivedMessage, "report.txt") {
-		t.Errorf("agent message should reference filename, got: %q", receivedMessage)
+	if !strings.Contains(receivedInput, "report.txt") {
+		t.Errorf("agent input should reference filename, got: %q", receivedInput)
 	}
-	if !strings.Contains(receivedMessage, "please review") {
-		t.Errorf("agent message should include comment, got: %q", receivedMessage)
+	if !strings.Contains(receivedInput, "please review") {
+		t.Errorf("agent input should include comment, got: %q", receivedInput)
+	}
+
+	if result.ResponseID != "resp_test" {
+		t.Errorf("expected response ID %q, got %q", "resp_test", result.ResponseID)
 	}
 }

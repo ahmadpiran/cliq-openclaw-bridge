@@ -16,7 +16,6 @@ import (
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/gateway"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/handler"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/middleware"
-	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/session"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/store"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/worker"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/zoho"
@@ -61,10 +60,12 @@ func main() {
 	gw := gateway.New(gateway.Config{
 		BaseURL:        cfg.OpenClaw.BaseURL,
 		APIKey:         cfg.OpenClaw.APIKey,
+		Model:          cfg.OpenClaw.Model,
 		MaxRetries:     cfg.OpenClaw.MaxRetries,
 		InitialBackoff: cfg.OpenClaw.InitialBackoff,
 		MaxBackoff:     cfg.OpenClaw.MaxBackoff,
 		HTTPTimeout:    cfg.OpenClaw.HTTPTimeout,
+		RespondTimeout: cfg.OpenClaw.ReplyTimeout,
 	})
 
 	// --- Zoho Reply Sender ---
@@ -76,17 +77,6 @@ func main() {
 		slog.Warn("ZOHO_REPLY_WEBHOOK_URL not set — reply-back disabled")
 	}
 
-	// --- Session Reader ---
-	// Tails OpenClaw JSONL session files to extract agent replies.
-	// Replaced by POST /notify push when OpenClaw implements message:sent hook.
-	var sessionReader handler.SessionReader
-	if cfg.OpenClaw.AgentsDir != "" {
-		sessionReader = session.NewReader(cfg.OpenClaw.AgentsDir, "main")
-		slog.Info("session reader configured", "agents_dir", cfg.OpenClaw.AgentsDir)
-	} else {
-		slog.Warn("OPENCLAW_AGENTS_DIR not set — reply-back disabled")
-	}
-
 	// --- Workspace Dir ---
 	if cfg.OpenClaw.WorkspaceDir != "" {
 		slog.Info("workspace dir configured",
@@ -96,13 +86,11 @@ func main() {
 	}
 
 	// --- Worker Pool ---
-	// Dispatcher forwards jobs and returns immediately.
-	// Reply-back runs in a background goroutine per job.
+	// Dispatcher calls /v1/responses synchronously and delivers the reply before returning.
 	dispatcher := handler.NewDispatcher(
 		gw,
 		refresher,
 		sender,
-		sessionReader,
 		cfg.OpenClaw.WorkspaceDir,
 		cfg.OpenClaw.ReplyTimeout,
 	)

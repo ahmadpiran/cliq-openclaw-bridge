@@ -16,6 +16,7 @@ import (
 	"time"
 )
 
+// ForwardRequest is kept for the legacy hooks endpoint (used by forwardRaw).
 type ForwardRequest struct {
 	Message    string    `json:"message"`
 	Name       string    `json:"name"`
@@ -24,38 +25,212 @@ type ForwardRequest struct {
 	ReceivedAt time.Time `json:"-"`
 }
 
+// RespondRequest is the input for the /v1/responses endpoint.
+type RespondRequest struct {
+	Input          string
+	PrevResponseID string // empty on first message in a channel
+	RequestID      string
+	ReceivedAt     time.Time
+}
+
+// RespondResult carries the response ID (for threading) and the reply text.
+type RespondResult struct {
+	ResponseID string
+	Text       string
+}
+
 type Config struct {
 	BaseURL        string
 	APIKey         string
+	Model          string        // model identifier forwarded to /v1/responses
 	MaxRetries     int
 	InitialBackoff time.Duration
 	MaxBackoff     time.Duration
-	HTTPTimeout    time.Duration
+	HTTPTimeout    time.Duration // for short requests (hooks, file downloads)
+	RespondTimeout time.Duration // for /v1/responses calls (agent processing time)
 }
 
 func DefaultConfig(baseURL, apiKey string) Config {
 	return Config{
 		BaseURL:        baseURL,
 		APIKey:         apiKey,
+		Model:          "anthropic/claude-sonnet-4-6",
 		MaxRetries:     4,
 		InitialBackoff: 500 * time.Millisecond,
 		MaxBackoff:     30 * time.Second,
 		HTTPTimeout:    15 * time.Second,
+		RespondTimeout: 120 * time.Second,
 	}
 }
 
 type Client struct {
-	cfg  Config
-	http *http.Client
+	cfg         Config
+	http        *http.Client // short timeout — hooks, file downloads
+	respondHTTP *http.Client // no client timeout — context deadline governs Respond()
 }
 
 func New(cfg Config) *Client {
+	if cfg.Model == "" {
+		cfg.Model = "anthropic/claude-sonnet-4-6"
+	}
+	if cfg.RespondTimeout == 0 {
+		cfg.RespondTimeout = 120 * time.Second
+	}
 	return &Client{
-		cfg:  cfg,
-		http: &http.Client{Timeout: cfg.HTTPTimeout},
+		cfg:         cfg,
+		http:        &http.Client{Timeout: cfg.HTTPTimeout},
+		respondHTTP: &http.Client{},
 	}
 }
 
+// Respond sends a message to the /v1/responses endpoint and returns the agent
+// reply along with the response ID that must be passed as PrevResponseID on the
+// next call for the same channel to maintain conversation continuity.
+func (c *Client) Respond(ctx context.Context, req RespondRequest) (*RespondResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.cfg.RespondTimeout)
+	defer cancel()
+
+	reqBody := struct {
+		Model          string `json:"model"`
+		Input          string `json:"input"`
+		PrevResponseID string `json:"previous_response_id,omitempty"`
+	}{
+		Model:          c.cfg.Model,
+		Input:          req.Input,
+		PrevResponseID: req.PrevResponseID,
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("marshal respond request: %w", err)
+	}
+
+	slog.Debug("posting to openclaw responses api",
+		"endpoint", c.cfg.BaseURL+"/v1/responses",
+		"has_prev_response", req.PrevResponseID != "",
+		"request_id", req.RequestID,
+	)
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.BaseURL+"/v1/responses", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build respond request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+
+	resp, err := c.respondHTTP.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("respond request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("respond: status %d", resp.StatusCode)
+	}
+
+	var respBody struct {
+		ID     string `json:"id"`
+		Output []struct {
+			Type    string `json:"type"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&respBody); err != nil {
+		return nil, fmt.Errorf("decode respond response: %w", err)
+	}
+
+	var text string
+	for _, item := range respBody.Output {
+		if item.Type != "message" {
+			continue
+		}
+		for _, block := range item.Content {
+			if block.Type == "output_text" && block.Text != "" {
+				text = block.Text
+			}
+		}
+	}
+
+	slog.Debug("openclaw respond result",
+		"response_id", respBody.ID,
+		"text_len", len(text),
+		"request_id", req.RequestID,
+	)
+
+	return &RespondResult{ResponseID: respBody.ID, Text: text}, nil
+}
+
+// DownloadAndRespond downloads a file attachment from Zoho, saves it to the
+// OpenClaw workspace, then forwards a reference message via the responses API.
+func (c *Client) DownloadAndRespond(
+	ctx context.Context,
+	srcURL, filename, mimeType, zohoToken, comment, prevResponseID, workspaceDir string,
+) (*RespondResult, error) {
+	// --- Download from Zoho ---
+	dlReq, err := http.NewRequestWithContext(ctx, http.MethodGet, srcURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build download request: %w", err)
+	}
+	if zohoToken != "" {
+		dlReq.Header.Set("Authorization", "Zoho-oauthtoken "+zohoToken)
+	}
+
+	resp, err := c.http.Do(dlReq)
+	if err != nil {
+		return nil, fmt.Errorf("download file from zoho: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("zoho download status: %s", resp.Status)
+	}
+
+	// --- Save to workspace ---
+	uploadsDir := filepath.Join(workspaceDir, "uploads")
+	if err := os.MkdirAll(uploadsDir, 0755); err != nil {
+		return nil, fmt.Errorf("create uploads dir: %w", err)
+	}
+
+	safeFilename := filepath.Base(filename)
+	destPath := filepath.Join(uploadsDir, safeFilename)
+
+	f, err := os.Create(destPath)
+	if err != nil {
+		return nil, fmt.Errorf("create workspace file: %w", err)
+	}
+
+	written, err := io.Copy(f, resp.Body)
+	f.Close()
+	if err != nil {
+		os.Remove(destPath)
+		return nil, fmt.Errorf("write workspace file: %w", err)
+	}
+
+	slog.Info("file saved to workspace",
+		"filename", safeFilename,
+		"bytes", written,
+		"dest", destPath,
+	)
+
+	// --- Tell the agent to process it ---
+	agentPath := "~/workspace/uploads/" + safeFilename
+	var message string
+	if comment != "" {
+		message = fmt.Sprintf("%s\n\n[File saved to workspace: %s | Type: %s]", comment, agentPath, mimeType)
+	} else {
+		message = fmt.Sprintf("A file has been shared. Please process it: %s (type: %s)", agentPath, mimeType)
+	}
+
+	return c.Respond(ctx, RespondRequest{
+		Input:          message,
+		PrevResponseID: prevResponseID,
+	})
+}
+
+// Forward sends to the legacy /hooks/agent endpoint. Used only for forwardRaw
+// (unparseable payloads where channel is unknown).
 func (c *Client) Forward(ctx context.Context, req ForwardRequest) error {
 	body, err := json.Marshal(struct {
 		Message    string `json:"message"`
@@ -72,7 +247,7 @@ func (c *Client) Forward(ctx context.Context, req ForwardRequest) error {
 		return fmt.Errorf("marshal forward request: %w", err)
 	}
 
-	slog.Debug("forwarding to openclaw",
+	slog.Debug("forwarding to openclaw hooks",
 		"endpoint", c.cfg.BaseURL+"/hooks/agent",
 		"payload", string(body),
 	)
@@ -90,82 +265,6 @@ func (c *Client) Forward(ctx context.Context, req ForwardRequest) error {
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
 		return c.http.Do(httpReq)
-	})
-}
-
-// DownloadAndForward downloads a file from Zoho, saves it to the OpenClaw
-// workspace, then sends the agent a message referencing the saved path.
-// OpenClaw's native pdf tool handles text extraction and image rasterization.
-func (c *Client) DownloadAndForward(
-	ctx context.Context,
-	srcURL, filename, mimeType, zohoToken, comment, sessionKey, workspaceDir string,
-) error {
-	// --- Download from Zoho ---
-	dlReq, err := http.NewRequestWithContext(ctx, http.MethodGet, srcURL, nil)
-	if err != nil {
-		return fmt.Errorf("build download request: %w", err)
-	}
-	if zohoToken != "" {
-		dlReq.Header.Set("Authorization", "Zoho-oauthtoken "+zohoToken)
-	}
-
-	resp, err := c.http.Do(dlReq)
-	if err != nil {
-		return fmt.Errorf("download file from zoho: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("zoho download status: %s", resp.Status)
-	}
-
-	// --- Save to workspace ---
-	uploadsDir := filepath.Join(workspaceDir, "uploads")
-	if err := os.MkdirAll(uploadsDir, 0755); err != nil {
-		return fmt.Errorf("create uploads dir: %w", err)
-	}
-
-	// Sanitise filename to prevent path traversal.
-	safeFilename := filepath.Base(filename)
-	destPath := filepath.Join(uploadsDir, safeFilename)
-
-	f, err := os.Create(destPath)
-	if err != nil {
-		return fmt.Errorf("create workspace file: %w", err)
-	}
-
-	written, err := io.Copy(f, resp.Body)
-	f.Close()
-	if err != nil {
-		os.Remove(destPath)
-		return fmt.Errorf("write workspace file: %w", err)
-	}
-
-	slog.Info("file saved to workspace",
-		"filename", safeFilename,
-		"bytes", written,
-		"dest", destPath,
-	)
-
-	// --- Tell the agent to process it ---
-	// Use the OpenClaw container's internal workspace path.
-	agentPath := "~/workspace/uploads/" + safeFilename
-
-	var message string
-	if comment != "" {
-		message = fmt.Sprintf("%s\n\n[File saved to workspace: %s | Type: %s]",
-			comment, agentPath, mimeType)
-	} else {
-		message = fmt.Sprintf(
-			"A file has been shared. Please process it: %s (type: %s)",
-			agentPath, mimeType,
-		)
-	}
-
-	return c.Forward(ctx, ForwardRequest{
-		Message:    message,
-		Name:       "Zoho Cliq",
-		SessionKey: sessionKey,
 	})
 }
 
