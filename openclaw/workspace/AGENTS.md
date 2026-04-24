@@ -49,9 +49,12 @@ Examples of what to persist proactively:
 
 ### Session continuity
 
-Each Zoho Cliq channel has its own isolated session key (`zoho-cliq:<channelID>`),
-so conversations in different channels do not share context. Use `/new` to
-start a fresh session within a channel.
+Each Zoho Cliq channel has its own isolated session key. Each incoming message
+arrives in a fresh context window — read `~/workspace/memory/` at the start of
+every response to restore prior conversation context. Write new facts to memory
+immediately so the next session can pick them up.
+
+Use `/new` to intentionally start a fresh session within a channel.
 
 ### File size limits
 

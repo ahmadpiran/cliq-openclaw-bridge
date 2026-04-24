@@ -136,8 +136,13 @@ func (d *Dispatcher) forward(ctx context.Context, job worker.Job, p zohoMessageP
 
 	message := string(job.Payload)
 	if p.Message.Text != "" {
-		message = fmt.Sprintf("[Zoho Cliq] %s wrote in #%s: %s",
+		userMsg := fmt.Sprintf("[Zoho Cliq] %s wrote in #%s: %s",
 			p.Message.Sender, p.Message.ChannelTitle, p.Message.Text)
+		if d.sessionReader != nil {
+			message = "[Session note: new context window — silently read ~/workspace/memory/ to restore prior conversation context before responding]\n" + userMsg
+		} else {
+			message = userMsg
+		}
 	}
 
 	dispatchTime := time.Now()
