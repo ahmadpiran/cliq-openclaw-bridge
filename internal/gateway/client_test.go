@@ -213,15 +213,18 @@ func TestDownloadAndRespond_SavesFileAndSendsMessage(t *testing.T) {
 	}))
 	defer zohoSrv.Close()
 
-	// Simulate OpenClaw /v1/responses endpoint.
+	// Simulate OpenClaw /v1/responses endpoint (SSE stream).
 	var receivedInput string
 	openclawSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		json.NewDecoder(r.Body).Decode(&body)
 		receivedInput, _ = body["input"].(string)
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"id":"resp_test","output":[{"type":"message","content":[{"type":"output_text","text":"got it"}]}]}`))
+		w.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_test\"}}\n\n"))
+		w.Write([]byte("data: {\"type\":\"response.output_text.done\",\"text\":\"got it\"}\n\n"))
+		w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_test\"}}\n\n"))
+		w.Write([]byte("data: [DONE]\n\n"))
 	}))
 	defer openclawSrv.Close()
 

@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -96,10 +97,12 @@ func (c *Client) Respond(ctx context.Context, req RespondRequest) (*RespondResul
 		Model          string `json:"model"`
 		Input          string `json:"input"`
 		PrevResponseID string `json:"previous_response_id,omitempty"`
+		Stream         bool   `json:"stream"`
 	}{
 		Model:          c.cfg.Model,
 		Input:          req.Input,
 		PrevResponseID: req.PrevResponseID,
+		Stream:         true,
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -135,51 +138,89 @@ func (c *Client) Respond(ctx context.Context, req RespondRequest) (*RespondResul
 		return nil, fmt.Errorf("respond: status %d: %s", resp.StatusCode, string(body))
 	}
 
-	var respBody struct {
-		ID     string `json:"id"`
-		Output []struct {
-			Type    string `json:"type"`
-			Name    string `json:"name"`    // present on function_call items
-			Content []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"content"`
-		} `json:"output"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&respBody); err != nil {
-		return nil, fmt.Errorf("decode respond response: %w", err)
-	}
-
-	var text string
+	// Parse the SSE stream. Each non-empty "data:" line is a JSON event.
+	var responseID, text string
 	var toolCalls []string
-	for _, item := range respBody.Output {
-		switch item.Type {
-		case "function_call":
-			if item.Name != "" {
-				toolCalls = append(toolCalls, item.Name)
-			}
-		case "message":
-			for _, block := range item.Content {
-				if block.Type == "output_text" && block.Text != "" {
-					text = block.Text
+	var seenEventTypes []string
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 128*1024), 128*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+
+		var event struct {
+			Type     string `json:"type"`
+			Text     string `json:"text"` // response.output_text.done
+			Response *struct {
+				ID string `json:"id"`
+			} `json:"response"`
+			Item *struct {
+				Type    string `json:"type"`
+				Name    string `json:"name"`
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"item"`
+		}
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			continue
+		}
+
+		seenEventTypes = append(seenEventTypes, event.Type)
+
+		switch event.Type {
+		case "response.output_item.added":
+			// Capture tool name as soon as the item is announced.
+			if event.Item != nil && (event.Item.Type == "function_call" || event.Item.Type == "computer_call") {
+				if event.Item.Name != "" {
+					toolCalls = append(toolCalls, event.Item.Name)
 				}
+			}
+		case "response.output_text.done":
+			if event.Text != "" {
+				text = event.Text
+			}
+		case "response.output_item.done":
+			// Fallback: pick up text from completed message items.
+			if event.Item != nil && event.Item.Type == "message" {
+				for _, block := range event.Item.Content {
+					if block.Type == "output_text" && block.Text != "" {
+						text = block.Text
+					}
+				}
+			}
+		case "response.completed", "response.done":
+			if event.Response != nil && event.Response.ID != "" {
+				responseID = event.Response.ID
+			}
+		case "response.created":
+			if event.Response != nil && responseID == "" {
+				responseID = event.Response.ID
 			}
 		}
 	}
-
-	outputTypes := make([]string, len(respBody.Output))
-	for i, item := range respBody.Output {
-		outputTypes[i] = item.Type
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("read response stream: %w", err)
 	}
+
 	slog.Info("openclaw respond result",
-		"response_id", respBody.ID,
+		"response_id", responseID,
 		"text_len", len(text),
-		"tool_calls", len(toolCalls),
-		"output_types", outputTypes,
+		"tool_calls", toolCalls,
+		"event_types", seenEventTypes,
 		"request_id", req.RequestID,
 	)
 
-	return &RespondResult{ResponseID: respBody.ID, Text: text, ToolCalls: toolCalls}, nil
+	return &RespondResult{ResponseID: responseID, Text: text, ToolCalls: toolCalls}, nil
 }
 
 // DownloadAndRespond downloads a file attachment from Zoho, saves it to the
