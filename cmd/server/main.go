@@ -16,6 +16,7 @@ import (
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/gateway"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/handler"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/middleware"
+	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/session"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/store"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/worker"
 	"github.com/ahmadpiran/cliq-openclaw-bridge/internal/zoho"
@@ -94,6 +95,14 @@ func main() {
 		cfg.OpenClaw.WorkspaceDir,
 		cfg.OpenClaw.ReplyTimeout,
 	)
+
+	if cfg.OpenClaw.AgentsDir != "" {
+		dispatcher.SetSessionReader(session.NewReader(cfg.OpenClaw.AgentsDir, "main"))
+		slog.Info("session reader configured for tool call streaming",
+			"agents_dir", cfg.OpenClaw.AgentsDir)
+	} else {
+		slog.Warn("OPENCLAW_AGENTS_DIR not set — real-time tool call notifications disabled")
+	}
 
 	pool := worker.New(worker.Config{
 		Workers:    cfg.Worker.Workers,

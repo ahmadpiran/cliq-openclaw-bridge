@@ -141,7 +141,6 @@ func (c *Client) Respond(ctx context.Context, req RespondRequest) (*RespondResul
 	// Parse the SSE stream. Each non-empty "data:" line is a JSON event.
 	var responseID, text string
 	var toolCalls []string
-	var seenEventTypes []string
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 128*1024), 128*1024)
@@ -174,8 +173,6 @@ func (c *Client) Respond(ctx context.Context, req RespondRequest) (*RespondResul
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
 			continue
 		}
-
-		seenEventTypes = append(seenEventTypes, event.Type)
 
 		switch event.Type {
 		case "response.output_item.added":
@@ -212,11 +209,10 @@ func (c *Client) Respond(ctx context.Context, req RespondRequest) (*RespondResul
 		return nil, fmt.Errorf("read response stream: %w", err)
 	}
 
-	slog.Info("openclaw respond result",
+	slog.Debug("openclaw respond result",
 		"response_id", responseID,
 		"text_len", len(text),
 		"tool_calls", toolCalls,
-		"event_types", seenEventTypes,
 		"request_id", req.RequestID,
 	)
 

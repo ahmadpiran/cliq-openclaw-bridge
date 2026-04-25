@@ -25,6 +25,14 @@ type Forwarder interface {
 	DownloadAndRespond(ctx context.Context, srcURL, filename, mimeType, zohoToken, comment, prevResponseID, workspaceDir string) (*gateway.RespondResult, error)
 }
 
+// SessionReader is satisfied by *session.Reader.
+// FindLatestSessionFile locates the JSONL file OpenClaw is writing for the
+// current request; TailToolCalls streams tool-call names as they appear.
+type SessionReader interface {
+	FindLatestSessionFile(afterTime time.Time, sessionKey string) (string, error)
+	TailToolCalls(ctx context.Context, sessionFile string, afterTime time.Time, out chan<- string)
+}
+
 // ZohoSender is satisfied by *zoho.Sender.
 type ZohoSender interface {
 	PostToChannel(ctx context.Context, userID, text string) error
@@ -86,6 +94,7 @@ type Dispatcher struct {
 	workspaceDir       string
 	replyTimeout       time.Duration
 	channelResponseIDs sync.Map // channelID string → last response ID string
+	sessionReader      SessionReader // optional; nil disables real-time tool streaming
 }
 
 func NewDispatcher(
@@ -101,6 +110,65 @@ func NewDispatcher(
 		sender:       sender,
 		workspaceDir: workspaceDir,
 		replyTimeout: replyTimeout,
+	}
+}
+
+// SetSessionReader enables real-time tool call streaming via JSONL tailing.
+// Call after NewDispatcher; safe to call at most once before serving traffic.
+func (d *Dispatcher) SetSessionReader(sr SessionReader) {
+	d.sessionReader = sr
+}
+
+// streamToolCalls tails the session JSONL file OpenClaw writes for the current
+// request and posts each tool call name to Zoho Cliq as it fires. Exits when
+// ctx is cancelled (caller cancels after gw.Respond returns).
+func (d *Dispatcher) streamToolCalls(ctx context.Context, requestID, userID string, afterTime time.Time) {
+	// Retry finding the session file — it appears shortly after the first tool
+	// call, which may be a second or two into processing.
+	var sessionFile string
+	for attempt := 0; attempt < 10; attempt++ {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		f, err := d.sessionReader.FindLatestSessionFile(afterTime, "")
+		if err == nil {
+			sessionFile = f
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	if sessionFile == "" {
+		slog.Debug("streamToolCalls: no session file found",
+			"request_id", requestID)
+		return
+	}
+
+	slog.Debug("streamToolCalls: tailing session file",
+		"request_id", requestID,
+		"file", sessionFile)
+
+	toolNames := make(chan string, 16)
+	go d.sessionReader.TailToolCalls(ctx, sessionFile, afterTime, toolNames)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case name := <-toolNames:
+			slog.Info("dispatcher: tool call in progress",
+				"request_id", requestID,
+				"tool", name)
+			if err := d.sender.PostToChannel(ctx, userID, "⚙️ "+name); err != nil {
+				slog.Error("dispatcher: failed to post tool call notification",
+					"request_id", requestID, "error", err)
+			}
+		}
 	}
 }
 
@@ -136,6 +204,15 @@ func (d *Dispatcher) forward(ctx context.Context, job worker.Job, p zohoMessageP
 	}
 
 	prevID := d.prevResponseID(channelID)
+	dispatchTime := time.Now()
+
+	// Stream tool calls in real time while the agent is processing.
+	var toolCancel context.CancelFunc
+	if d.sessionReader != nil && d.sender != nil && p.Message.SenderID != "" {
+		var toolCtx context.Context
+		toolCtx, toolCancel = context.WithCancel(ctx)
+		go d.streamToolCalls(toolCtx, job.RequestID, p.Message.SenderID, dispatchTime)
+	}
 
 	result, err := d.gw.Respond(ctx, gateway.RespondRequest{
 		Input:          message,
@@ -143,6 +220,9 @@ func (d *Dispatcher) forward(ctx context.Context, job worker.Job, p zohoMessageP
 		RequestID:      job.RequestID,
 		ReceivedAt:     job.ReceivedAt,
 	})
+	if toolCancel != nil {
+		toolCancel()
+	}
 	if err != nil {
 		return fmt.Errorf("openclaw respond: %w", err)
 	}

@@ -19,6 +19,8 @@ type jsonlEntry struct {
 		Content []struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
+			Name string `json:"name"` // tool_use blocks
+			ID   string `json:"id"`   // tool_use blocks
 		} `json:"content"`
 	} `json:"message,omitempty"`
 }
@@ -141,6 +143,68 @@ func (r *Reader) TailAssistantMessages(
 			out <- text
 		}
 	}
+}
+
+// TailToolCalls watches sessionFile and sends each new tool call name to out
+// as it appears. Tool calls are deduplicated by their ID. Stops when ctx is
+// cancelled.
+func (r *Reader) TailToolCalls(
+	ctx context.Context,
+	sessionFile string,
+	afterTime time.Time,
+	out chan<- string,
+) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	seen := make(map[string]bool)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for _, name := range scanToolCalls(sessionFile, afterTime, seen) {
+				select {
+				case out <- name:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}
+}
+
+func scanToolCalls(path string, afterTime time.Time, seen map[string]bool) []string {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var results []string
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 2<<20), 2<<20)
+
+	for scanner.Scan() {
+		var entry jsonlEntry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			continue
+		}
+		if entry.Type != "message" || entry.Message == nil || entry.Message.Role != "assistant" {
+			continue
+		}
+		if !entry.Timestamp.After(afterTime) {
+			continue
+		}
+		for _, c := range entry.Message.Content {
+			if c.Type == "tool_use" && c.Name != "" && c.ID != "" && !seen[c.ID] {
+				seen[c.ID] = true
+				results = append(results, c.Name)
+			}
+		}
+	}
+	return results
 }
 
 func lastAssistantMessage(path string, afterTime time.Time) (string, error) {
