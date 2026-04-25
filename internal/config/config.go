@@ -86,7 +86,7 @@ func Load() (*Config, error) {
 	cfg.OpenClaw = OpenClawConfig{
 		BaseURL:        envRequired("OPENCLAW_BASE_URL", &errs),
 		APIKey:         envRequired("OPENCLAW_API_KEY", &errs),
-		Model:          envOr("OPENCLAW_MODEL", "anthropic/claude-sonnet-4-6"),
+		Model:          envOr("OPENCLAW_MODEL", "openclaw"),
 		MaxRetries:     envInt("OPENCLAW_MAX_RETRIES", 4),
 		InitialBackoff: envDuration("OPENCLAW_INITIAL_BACKOFF", 500*time.Millisecond),
 		MaxBackoff:     envDuration("OPENCLAW_MAX_BACKOFF", 30*time.Second),

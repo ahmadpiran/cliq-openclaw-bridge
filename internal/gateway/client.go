@@ -54,7 +54,7 @@ func DefaultConfig(baseURL, apiKey string) Config {
 	return Config{
 		BaseURL:        baseURL,
 		APIKey:         apiKey,
-		Model:          "anthropic/claude-sonnet-4-6",
+		Model:          "openclaw",
 		MaxRetries:     4,
 		InitialBackoff: 500 * time.Millisecond,
 		MaxBackoff:     30 * time.Second,
@@ -71,7 +71,7 @@ type Client struct {
 
 func New(cfg Config) *Client {
 	if cfg.Model == "" {
-		cfg.Model = "anthropic/claude-sonnet-4-6"
+		cfg.Model = "openclaw"
 	}
 	if cfg.RespondTimeout == 0 {
 		cfg.RespondTimeout = 120 * time.Second
@@ -104,11 +104,10 @@ func (c *Client) Respond(ctx context.Context, req RespondRequest) (*RespondResul
 		return nil, fmt.Errorf("marshal respond request: %w", err)
 	}
 
-	slog.Info("posting to openclaw responses api",
+	slog.Debug("posting to openclaw responses api",
 		"endpoint", c.cfg.BaseURL+"/v1/responses",
 		"has_prev_response", req.PrevResponseID != "",
 		"request_id", req.RequestID,
-		"body", string(body),
 	)
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.BaseURL+"/v1/responses", bytes.NewReader(body))
