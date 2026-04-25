@@ -123,33 +123,24 @@ func (d *Dispatcher) SetSessionReader(sr SessionReader) {
 // request and posts each tool call name to Zoho Cliq as it fires. Exits when
 // ctx is cancelled (caller cancels after gw.Respond returns).
 func (d *Dispatcher) streamToolCalls(ctx context.Context, requestID, userID string, afterTime time.Time) {
-	// Retry finding the session file — it appears shortly after the first tool
-	// call, which may be a second or two into processing.
+	// Keep polling for the session file until found or the request completes.
+	// OpenClaw continues in an existing file whose mod time only updates once the
+	// first entry for this request is written — which can be 10+ seconds in.
 	var sessionFile string
-	for attempt := 0; attempt < 10; attempt++ {
+	findTicker := time.NewTicker(500 * time.Millisecond)
+	defer findTicker.Stop()
+	for sessionFile == "" {
 		select {
 		case <-ctx.Done():
 			return
-		default:
+		case <-findTicker.C:
+			if f, err := d.sessionReader.FindLatestSessionFile(afterTime, ""); err == nil {
+				sessionFile = f
+			}
 		}
-		f, err := d.sessionReader.FindLatestSessionFile(afterTime, "")
-		if err == nil {
-			sessionFile = f
-			break
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(500 * time.Millisecond):
-		}
-	}
-	if sessionFile == "" {
-		slog.Debug("streamToolCalls: no session file found",
-			"request_id", requestID)
-		return
 	}
 
-	slog.Debug("streamToolCalls: tailing session file",
+	slog.Info("streamToolCalls: tailing session file",
 		"request_id", requestID,
 		"file", sessionFile)
 
