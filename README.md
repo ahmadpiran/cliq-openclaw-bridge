@@ -181,3 +181,15 @@ openclaw/
   hooks/zoho-bridge-notify/  — optional OpenClaw push hook
   workspace/AGENTS.md        — agent instructions placed in OpenClaw workspace
 ```
+
+## Contributing
+
+1. Fork the repo and create a feature branch.
+2. Make your changes — ensure `go test ./...` and `golangci-lint run ./...` pass.
+3. Open a pull request with a clear description of what changed and why.
+
+Bug reports and feature requests are welcome via GitHub Issues.
+
+## License
+
+[MIT](LICENSE) © 2026 Ahmad Piran
