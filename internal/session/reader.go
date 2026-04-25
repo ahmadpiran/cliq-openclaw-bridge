@@ -198,7 +198,7 @@ func scanToolCalls(path string, afterTime time.Time, seen map[string]bool) []str
 			continue
 		}
 		for _, c := range entry.Message.Content {
-			if c.Type == "tool_use" && c.Name != "" && c.ID != "" && !seen[c.ID] {
+			if c.Type == "toolCall" && c.Name != "" && c.ID != "" && !seen[c.ID] {
 				seen[c.ID] = true
 				results = append(results, c.Name)
 			}
