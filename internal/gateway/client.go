@@ -104,10 +104,11 @@ func (c *Client) Respond(ctx context.Context, req RespondRequest) (*RespondResul
 		return nil, fmt.Errorf("marshal respond request: %w", err)
 	}
 
-	slog.Debug("posting to openclaw responses api",
+	slog.Info("posting to openclaw responses api",
 		"endpoint", c.cfg.BaseURL+"/v1/responses",
 		"has_prev_response", req.PrevResponseID != "",
 		"request_id", req.RequestID,
+		"body", string(body),
 	)
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.BaseURL+"/v1/responses", bytes.NewReader(body))
@@ -124,7 +125,13 @@ func (c *Client) Respond(ctx context.Context, req RespondRequest) (*RespondResul
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("respond: status %d", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		slog.Error("openclaw respond error",
+			"status", resp.StatusCode,
+			"body", string(body),
+			"request_id", req.RequestID,
+		)
+		return nil, fmt.Errorf("respond: status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var respBody struct {
