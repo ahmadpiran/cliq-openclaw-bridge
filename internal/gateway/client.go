@@ -33,10 +33,12 @@ type RespondRequest struct {
 	ReceivedAt     time.Time
 }
 
-// RespondResult carries the response ID (for threading) and the reply text.
+// RespondResult carries the response ID (for threading), the reply text, and
+// the ordered list of tool names the agent called during this response.
 type RespondResult struct {
 	ResponseID string
 	Text       string
+	ToolCalls  []string // e.g. ["read", "bash", "read"]
 }
 
 type Config struct {
@@ -137,6 +139,7 @@ func (c *Client) Respond(ctx context.Context, req RespondRequest) (*RespondResul
 		ID     string `json:"id"`
 		Output []struct {
 			Type    string `json:"type"`
+			Name    string `json:"name"`    // present on function_call items
 			Content []struct {
 				Type string `json:"type"`
 				Text string `json:"text"`
@@ -148,13 +151,18 @@ func (c *Client) Respond(ctx context.Context, req RespondRequest) (*RespondResul
 	}
 
 	var text string
+	var toolCalls []string
 	for _, item := range respBody.Output {
-		if item.Type != "message" {
-			continue
-		}
-		for _, block := range item.Content {
-			if block.Type == "output_text" && block.Text != "" {
-				text = block.Text
+		switch item.Type {
+		case "function_call":
+			if item.Name != "" {
+				toolCalls = append(toolCalls, item.Name)
+			}
+		case "message":
+			for _, block := range item.Content {
+				if block.Type == "output_text" && block.Text != "" {
+					text = block.Text
+				}
 			}
 		}
 	}
@@ -162,10 +170,11 @@ func (c *Client) Respond(ctx context.Context, req RespondRequest) (*RespondResul
 	slog.Debug("openclaw respond result",
 		"response_id", respBody.ID,
 		"text_len", len(text),
+		"tool_calls", len(toolCalls),
 		"request_id", req.RequestID,
 	)
 
-	return &RespondResult{ResponseID: respBody.ID, Text: text}, nil
+	return &RespondResult{ResponseID: respBody.ID, Text: text, ToolCalls: toolCalls}, nil
 }
 
 // DownloadAndRespond downloads a file attachment from Zoho, saves it to the

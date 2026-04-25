@@ -157,8 +157,8 @@ func (d *Dispatcher) forward(ctx context.Context, job worker.Job, p zohoMessageP
 		"continued_thread", prevID != "",
 	)
 
-	if result.Text != "" && d.sender != nil && p.Message.SenderID != "" {
-		d.deliverReply(ctx, job.RequestID, p.Message.SenderID, result.Text)
+	if d.sender != nil && p.Message.SenderID != "" {
+		d.deliverResult(ctx, job.RequestID, p.Message.SenderID, result)
 	}
 
 	return nil
@@ -218,11 +218,25 @@ func (d *Dispatcher) handleFile(ctx context.Context, job worker.Job, msg struct 
 		"response_id", result.ResponseID,
 	)
 
-	if result.Text != "" && d.sender != nil && msg.SenderID != "" {
-		d.deliverReply(ctx, job.RequestID, msg.SenderID, result.Text)
+	if d.sender != nil && msg.SenderID != "" {
+		d.deliverResult(ctx, job.RequestID, msg.SenderID, result)
 	}
 
 	return nil
+}
+
+// deliverResult sends a tool-call summary (if any) followed by the agent reply.
+func (d *Dispatcher) deliverResult(ctx context.Context, requestID, userID string, result *gateway.RespondResult) {
+	if len(result.ToolCalls) > 0 {
+		summary := "⚙️ " + strings.Join(result.ToolCalls, " · ")
+		if err := d.sender.PostToChannel(ctx, userID, summary); err != nil {
+			slog.Error("dispatcher: failed to post tool summary",
+				"request_id", requestID, "error", err)
+		}
+	}
+	if result.Text != "" {
+		d.deliverReply(ctx, requestID, userID, result.Text)
+	}
 }
 
 // deliverReply sends text and/or a file from a single agent reply.
