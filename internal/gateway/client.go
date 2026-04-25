@@ -167,10 +167,15 @@ func (c *Client) Respond(ctx context.Context, req RespondRequest) (*RespondResul
 		}
 	}
 
-	slog.Debug("openclaw respond result",
+	outputTypes := make([]string, len(respBody.Output))
+	for i, item := range respBody.Output {
+		outputTypes[i] = item.Type
+	}
+	slog.Info("openclaw respond result",
 		"response_id", respBody.ID,
 		"text_len", len(text),
 		"tool_calls", len(toolCalls),
+		"output_types", outputTypes,
 		"request_id", req.RequestID,
 	)
 
