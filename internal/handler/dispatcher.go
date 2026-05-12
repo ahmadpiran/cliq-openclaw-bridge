@@ -94,6 +94,7 @@ type Dispatcher struct {
 	workspaceDir       string
 	replyTimeout       time.Duration
 	channelResponseIDs sync.Map // channelID string → last response ID string
+	channelLocks       sync.Map // channelID string → chan struct{} (capacity-1 mutex)
 	sessionReader      SessionReader // optional; nil disables real-time tool streaming
 }
 
@@ -117,6 +118,30 @@ func NewDispatcher(
 // Call after NewDispatcher; safe to call at most once before serving traffic.
 func (d *Dispatcher) SetSessionReader(sr SessionReader) {
 	d.sessionReader = sr
+}
+
+// acquireChannel serializes requests per Zoho channel so a follow-up message
+// ("are you still processing?") always lands in the same thread rather than
+// starting a new session. Returns a release func and blocks until the channel
+// is free or ctx is cancelled.
+func (d *Dispatcher) acquireChannel(ctx context.Context, channelID string) (func(), error) {
+	v, _ := d.channelLocks.LoadOrStore(channelID, make(chan struct{}, 1))
+	lock := v.(chan struct{})
+	// Fast path — channel is free.
+	select {
+	case lock <- struct{}{}:
+		return func() { <-lock }, nil
+	default:
+	}
+	// Channel is busy — queue behind it.
+	slog.Info("dispatcher: channel busy, queuing message",
+		"channel_id", channelID)
+	select {
+	case lock <- struct{}{}:
+		return func() { <-lock }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // streamToolCalls tails the session JSONL file OpenClaw writes for the current
@@ -188,6 +213,12 @@ func (d *Dispatcher) prevResponseID(channelID string) string {
 func (d *Dispatcher) forward(ctx context.Context, job worker.Job, p zohoMessagePayload) error {
 	channelID := p.Message.Channel
 
+	release, err := d.acquireChannel(ctx, channelID)
+	if err != nil {
+		return fmt.Errorf("acquire channel lock: %w", err)
+	}
+	defer release()
+
 	message := string(job.Payload)
 	if p.Message.Text != "" {
 		message = fmt.Sprintf("[Zoho Cliq] %s wrote in #%s: %s",
@@ -246,6 +277,12 @@ func (d *Dispatcher) handleFile(ctx context.Context, job worker.Job, msg struct 
 	AttachmentName string `json:"attachment_name"`
 	AttachmentMime string `json:"attachment_mime"`
 }) error {
+	release, err := d.acquireChannel(ctx, msg.Channel)
+	if err != nil {
+		return fmt.Errorf("acquire channel lock: %w", err)
+	}
+	defer release()
+
 	if d.workspaceDir == "" {
 		slog.Warn("dispatcher: OPENCLAW_WORKSPACE_DIR not set, cannot save file",
 			"request_id", job.RequestID)
